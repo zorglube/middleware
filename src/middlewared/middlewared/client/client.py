@@ -6,7 +6,9 @@ from threading import Event as TEvent, Lock, Thread
 from ws4py.client.threadedclient import WebSocketClient
 from ws4py.websocket import WebSocket
 
+import aiohttp
 import argparse
+import asyncio
 from base64 import b64decode, b64encode
 import ctypes
 import errno
@@ -48,55 +50,20 @@ class Event(TEvent):
 CALL_TIMEOUT = int(os.environ.get('CALL_TIMEOUT', 60))
 
 
-class WSClient(WebSocketClient):
+class WSClientSession(object):
     def __init__(self, url, *args, **kwargs):
+        self.__url = url
         self.client = kwargs.pop('client')
         reserved_ports = kwargs.pop('reserved_ports')
         reserved_ports_blacklist = kwargs.pop('reserved_ports_blacklist')
         self.reserved_fd = None
         self.protocol = DDPProtocol(self)
         if not reserved_ports:
-            super(WSClient, self).__init__(url, *args, **kwargs)
+            super().__init__(*args, **kwargs)
         else:
-            """
-            All this code has been copied from WebSocketClient.__init__
-            because it is not prepared to handle a custom socket via method
-            overriding. We need to use socket.fromfd in case reserved_ports
-            is specified.
-            """
-            self.url = url
-            self.host = None
-            self.scheme = None
-            self.port = None
-            self.unix_socket_path = None
-            self.resource = None
-            self.ssl_options = kwargs.get('ssl_options') or {}
-            self.extra_headers = kwargs.get('headers') or []
-            self.exclude_headers = kwargs.get('exclude_headers') or []
-            self.exclude_headers = [x.lower() for x in self.exclude_headers]
-
-            if self.scheme == "wss":
-                # Prevent check_hostname requires server_hostname (ref #187)
-                if "cert_reqs" not in self.ssl_options:
-                    self.ssl_options["cert_reqs"] = ssl.CERT_NONE
-
-            self._parse_url()
-
             if self.unix_socket_path:
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
             else:
-                # Let's handle IPv4 and IPv6 addresses
-                # Simplified from CherryPy's code
-                try:
-                    family, socktype, proto, canonname, sa = socket.getaddrinfo(self.host, self.port, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)[0]
-                except socket.gaierror:
-                    family = socket.AF_INET
-                    if self.host.startswith('::'):
-                        family = socket.AF_INET6
-
-                    socktype = socket.SOCK_STREAM
-                    proto = 0
-
                 """
                 This is the line replaced to use socket.fromfd
                 """
@@ -105,11 +72,6 @@ class WSClient(WebSocketClient):
                     sock = socket.fromfd(self.reserved_fd, family, socktype, proto)
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    if hasattr(socket, 'AF_INET6') and family == socket.AF_INET6 and self.host.startswith('::'):
-                        try:
-                            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-                        except (AttributeError, socket.error):
-                            pass
                 except Exception as e:
                     if self.reserved_fd:
                         try:
@@ -118,15 +80,6 @@ class WSClient(WebSocketClient):
                             pass
                     raise e
 
-            WebSocket.__init__(self, sock, protocols=kwargs.get('protocols'),
-                               extensions=kwargs.get('extensions'),
-                               heartbeat_freq=kwargs.get('heartbeat_freq'))
-
-            self.stream.always_mask = True
-            self.stream.expect_masking = False
-            self.key = b64encode(os.urandom(16))
-            self._th = threading.Thread(target=self.run, name='WebSocketClient')
-            self._th.daemon = True
 
     def get_reserved_portfd(self, blacklist=None):
         """
@@ -163,6 +116,7 @@ class WSClient(WebSocketClient):
         return fd
 
     def connect(self):
+        self.ws_connect(self.__url)
         self.sock.settimeout(10)
         max_attempts = 3
         for i in range(max_attempts):
@@ -222,7 +176,7 @@ class Call(object):
         self.id = str(uuid.uuid4())
         self.method = method
         self.params = params
-        self.returned = Event()
+        self.returned = asyncio.Event()
         self.result = None
         self.errno = None
         self.error = None
@@ -283,7 +237,7 @@ class Client(object):
 
     def __init__(
         self, uri=None, reserved_ports=False, reserved_ports_blacklist=None,
-        py_exceptions=False,
+        py_exceptions=False, loop=None, threaded=False,
     ):
         """
         Arguments:
@@ -297,30 +251,48 @@ class Client(object):
         self._pings = {}
         self._py_exceptions = py_exceptions
         self._event_callbacks = {}
-        if uri is None:
-            uri = 'ws+unix:///var/run/middlewared.sock'
-        self._closed = Event()
-        self._connected = Event()
-        try:
-            self._ws = WSClient(
-                uri,
-                client=self,
-                reserved_ports=reserved_ports,
-                reserved_ports_blacklist=reserved_ports_blacklist,
-            )
-            if 'unix://' in uri:
-                self._ws.resource = '/websocket'
-            self._ws.connect()
-            self._connected.wait(10)
-            if not self._connected.is_set():
-                raise ClientException('Failed connection handshake')
-        except Exception as e:
-            if hasattr(self, '_ws'):
-                del self._ws
-            raise e
+        self._uri = uri or '/var/run/middlewared.sock'
+        self._closed = asyncio.Event()
+        self._connected = asyncio.Event()
+
+        self.loop = loop or asyncio.get_event_loop()
+
+        if 'unix://' in self._uri or self._uri.startswith('/'):
+            self._connector = aiohttp.UnixConnector(path=self._uri.split('unix://', 1)[-1], loop=self.loop)
+        else:
+            self._connector = aiohttp.TcpConnector(loop=self.loop)
+
+        if threaded:
+            self.__loopthread = threading.Thread(target=self.loop.run_forever, daemon=True)
+            self.__loopthread.start()
+            future = asyncio.run_coroutine_threadsafe(self._start_session(), loop=self.loop)
+            future.result()
+
+    async def _start_session(self):
+        self._cs = aiohttp.ClientSession(connector=self._connector)
+        self._ws = await self._cs._ws_connect('//unix/websocket')
+        self.on_open()
+        asyncio.ensure_future(self._handle_messages())
+        await asyncio.wait({self._connected.wait()}, loop=self.loop, timeout=10)
+        if not self._connected.is_set():
+            raise ClientException('Failed connection handshake')
+
+    async def _handle_messages(self):
+        async for msg in self._ws:
+            msg = json.loads(msg.data)
+            print("recv", msg)
+            self._recv(msg)
+        self._closed.set()
+
+    async def __aenter__(self):
+        await self._start_session()
+        return self
 
     def __enter__(self):
         return self
+
+    async def __aexit__(self, typ, value, traceback):
+        await self.aclose()
 
     def __exit__(self, typ, value, traceback):
         self.close()
@@ -328,7 +300,8 @@ class Client(object):
             raise
 
     def _send(self, data):
-        self._ws.send(json.dumps(data))
+        print("send", data)
+        asyncio.ensure_future(self._ws.send_str(json.dumps(data)), loop=self.loop)
 
     def _recv(self, message):
         _id = message.get('id')
@@ -387,9 +360,6 @@ class Client(object):
             'features': features,
         })
 
-    def on_close(self, code, reason=None):
-        self._closed.set()
-
     def _register_call(self, call):
         self._calls[call.id] = call
 
@@ -425,7 +395,10 @@ class Client(object):
         self._jobs_watching = True
         self.subscribe('core.get_jobs', self._jobs_callback)
 
-    def call(self, method, *params, **kwargs):
+    def call(self, *args, **kwargs):
+        return asyncio.run_coroutine_threadsafe(self.acall(*args, **kwargs), loop=self.loop).result()
+
+    async def acall(self, method, *params, **kwargs):
         timeout = kwargs.pop('timeout', CALL_TIMEOUT)
         job = kwargs.pop('job', False)
 
@@ -442,7 +415,8 @@ class Client(object):
             'params': c.params,
         })
 
-        if not c.returned.wait(timeout):
+        await asyncio.wait({c.returned.wait()}, loop=self.loop, timeout=timeout)
+        if not c.returned.is_set():
             self._unregister_call(c)
             raise CallTimeout("Call timeout")
 
@@ -508,13 +482,16 @@ class Client(object):
             return False
         return True
 
+    async def aclose(self):
+        await self._ws.close()
+        await self._cs.close()
+        await asyncio.wait({self._closed.wait()}, loop=self.loop, timeout=1)
+
     def close(self):
-        self._ws.close()
-        # Wait for websocketclient thread to close
-        self._closed.wait(1)
+        asyncio.run_coroutine_threadsafe(self.aclose(), loop=self.loop).result()
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-q', '--quiet', action='store_true')
     parser.add_argument('-u', '--uri')
@@ -557,7 +534,7 @@ def main():
 
     if args.name == 'call':
         try:
-            with Client(uri=args.uri) as c:
+            async with Client(uri=args.uri) as c:
                 try:
                     if args.username and args.password:
                         if not c.call('auth.login', args.username, args.password):
@@ -597,7 +574,7 @@ def main():
                             })
                             rv = c.call(args.method[0], *list(from_json(args.method[1:])), **kwargs)
                     else:
-                        rv = c.call(args.method[0], *list(from_json(args.method[1:])), **kwargs)
+                        rv = await c.acall(args.method[0], *list(from_json(args.method[1:])), **kwargs)
                     if isinstance(rv, (int, str)):
                         print(rv)
                     else:
@@ -700,4 +677,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
