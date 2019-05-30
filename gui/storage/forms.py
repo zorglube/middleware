@@ -2343,8 +2343,8 @@ class ReplicationForm(MiddlewareModelForm, ModelForm):
             'dom': data.pop('schedule_daymonth'),
             'month': data.pop('schedule_month'),
             'dow': data.pop('schedule_dayweek'),
-            'begin': data.pop('schedule_begin') or '00:00',
-            'end': data.pop('schedule_end') or '23:45',
+            'begin': (data.pop('schedule_begin') or time(0, 0)).isoformat()[:5],
+            'end': (data.pop('schedule_end') or time(23, 45)).isoformat()[:5],
         }
         if not (data.pop("enable_schedule") and data["auto"]):
             data["schedule"] = None
@@ -2355,8 +2355,8 @@ class ReplicationForm(MiddlewareModelForm, ModelForm):
             'dom': data.pop('restrict_schedule_daymonth'),
             'month': data.pop('restrict_schedule_month'),
             'dow': data.pop('restrict_schedule_dayweek'),
-            'begin': data.pop('restrict_schedule_begin') or '00:00',
-            'end': data.pop('restrict_schedule_end') or '23:45',
+            'begin': (data.pop('restrict_schedule_begin') or time(0 ,0)).isoformat()[:5],
+            'end': (data.pop('restrict_schedule_end') or time(23, 45)).isoformat()[:5],
         }
         if not (data.pop("enable_restrict_schedule")):
             data["restrict_schedule"] = None
