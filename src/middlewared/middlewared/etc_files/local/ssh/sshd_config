@@ -41,7 +41,7 @@ ClientAliveCountMax 3
 % if 'ClientAliveInterval' not in ssh_config['options']:
 ClientAliveInterval 15
 % endif
-% if 'NoneEnabled' not in ssh_config['options']:
+% if platform == 'FreeBSD' and 'NoneEnabled' not in ssh_config['options']:
 NoneEnabled yes
 % endif
 % if 'VersionAddendum' not in ssh_config['options']:
