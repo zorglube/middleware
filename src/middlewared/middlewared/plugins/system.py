@@ -218,7 +218,7 @@ class SystemAdvancedService(ConfigService):
             userland_reserved = 4831838208
         cp = subprocess.run(
             [
-                'autotune', '-o', f'--kernel-reserved={kernel_reserved}',
+                'autotune', f'--kernel-reserved={kernel_reserved}',
                 f'--userland-reserved={userland_reserved}', '--conf', conf
             ], capture_output=True
         )
