@@ -152,6 +152,14 @@ class NetworkConfigurationService(ConfigService):
                     'No more than 5 additional domains are allowed'
                 )
 
+        ad_enabled = await self.middleware.call('activedirectory.get_state') != 'DISABLED'
+        for param in ['hostname', 'hostname_b', 'hostname_virtual']:
+            if data.get(param) and ad_enabled: 
+                verrors.add(
+                    f'{schema}.{param}',
+                    'Changes to hostname are not permitted while AD is enabled'
+                )
+
         return verrors
 
     @accepts(

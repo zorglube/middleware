@@ -691,6 +691,11 @@ class ActiveDirectoryService(ConfigService):
                 "activedirectory_update.bindname",
                 "Bind credentials or kerberos keytab are required to join an AD domain."
             )
+        if new['certificate'] and not await self.middleware.call('certificate.query', [('id', '=', new['certificate')]):
+            verrors.add(
+                "activedirectory_update.certificate",
+                f"certificate [{new['certificate']}] does not exist"
+            )
         if new["bindpw"] and new["kerberos_principal"]:
             verrors.add(
                 "activedirectory_update.kerberos_principal",

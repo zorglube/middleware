@@ -484,6 +484,11 @@ class LDAPService(ConfigService):
                 "ldap_update.basedn",
                 "The basedn parameter is required."
             )
+        if new['certificate'] and not await self.middleware.call('certificate.query', [('id', '=', new['certificate')]):
+            verrors.add(
+                "ldap_update.certificate",
+                f"certificate [{new['certificate']}] does not exist"
+            )
         if not new["hostname"]:
             verrors.add(
                 "ldap_update.hostname",
