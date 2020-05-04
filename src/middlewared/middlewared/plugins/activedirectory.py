@@ -177,6 +177,14 @@ class ActiveDirectory_LDAP(object):
         if self._isopen:
             self._close()
 
+    def _convert_exception(self, ex):
+        if issubclass(type(ex), ldap.LDAPError) and ex.args:
+            raise CallError(f"{ex.args[0].get('desc')}: "
+                            f"{ex.args[0].get('info', '')}",
+                            errno.EFAULT, type(ex))
+        else:
+            raise CallError(str(ex))
+
     def _open(self):
         """
         We can only intialize a single host. In this case,
@@ -314,7 +322,7 @@ class ActiveDirectory_LDAP(object):
             if res:
                 self._isopen = True
             elif saved_bind_error:
-                raise CallError(saved_bind_error)
+                self._convert_exception(saved_bind_error)
 
         return (self._isopen is True)
 
@@ -832,7 +840,7 @@ class ActiveDirectoryService(ConfigService):
             except Exception as e:
                 raise ValidationError(
                     "activedirectory_update.bindpw",
-                    f"Failed to validate bind credentials: {e}"
+                    f"Failed to validate bind credentials: {e.errmsg}"
                 )
 
             try:
@@ -843,7 +851,7 @@ class ActiveDirectoryService(ConfigService):
             except Exception as e:
                 raise ValidationError(
                     "activedirectory_update",
-                    f"Failed to validate domain configuration: {e}"
+                    f"Failed to validate domain configuration: {e.errmsg}"
                 )
 
         new = await self.ad_compress(new)
