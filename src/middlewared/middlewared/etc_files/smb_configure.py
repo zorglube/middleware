@@ -290,7 +290,7 @@ def validate_group_mappings(middleware, conf):
             groupmap = []
     groups = get_groups(middleware)
     for g in groups:
-        if not any(filter(lambda x: g.upper() == x['ntgroup'].upper(), groupmap)):
+        if not any(filter(lambda x: g.upper() == x['ntgroup'].upper(), groupmap.values())):
             middleware.call_sync('smb.groupmap_add', g)
 
 

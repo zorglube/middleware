@@ -890,7 +890,7 @@ class ReportingService(ConfigService):
             os.makedirs(os.path.join(pwd, 'localhost'))
 
         # Create "${hostname}" -> "localhost" symlink if necessary
-        if hostname != 'localhost':
+        if hostname != 'localhost' and not os.path.exists(os.path.join(pwd, hostname)):
             os.symlink(os.path.join(pwd, 'localhost'), os.path.join(pwd, hostname))
 
         # Let's return a positive value to indicate that necessary collectd operations were performed successfully
