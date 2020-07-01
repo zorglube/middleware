@@ -732,29 +732,80 @@ class SharingSMBService(SharingService):
         if old['purpose'] != new['purpose']:
             await self.apply_presets(new)
 
+        old_is_locked = (await self.query([("id", "=", id)], {'get': True}))['locked']
+        if old['path'] != new['path']:
+            new_is_locked = await self.middleware.call('filesystem.path_is_encrypted',
+                                                       new['path'])
+        else:
+            new_is_locked = old_is_locked
+
         await self.compress(new)
         await self.middleware.call(
             'datastore.update', self._config.datastore, id, new,
             {'prefix': self._config.datastore_prefix})
 
-        enable_aapl = await self.check_aapl(new)
-        if newname != oldname:
-            # This is disruptive change. Share is actually being removed and replaced.
-            # Forcibly closes any existing SMB sessions.
-            await self.close_share(oldname)
+        self.logger.debug("old_is_locked: %s, new_is_locked: %s", new_is_locked, old_is_locked)
+
+        if not new_is_locked:
+            """
+            Enabling AAPL SMB2 extensions globally affects SMB shares. If this
+            happens, the SMB service _must_ be restarted. Skip this step if dataset
+            underlying the new path is encrypted.
+            """
+            enable_aapl = await self.check_aapl(new)
+        else:
+            enable_aapl = False
+
+        """
+         OLD    NEW   = dataset path is encrypted
+         ----------
+         -      -    = pre-12 behavior. Remove and replace if name changed, else update.
+         -      X    = Delete share from running configuration
+         X      -    = Add share to running configuration
+         X      X    = no-op
+        """
+        if old_is_locked and new_is_locked:
+            """
+            Configuration change only impacts a locked SMB share. From standpoint of
+            running config, this is a no-op. No need to restart or reload service.
+            """
+            return await self.get_instance(id)
+
+        elif not old_is_locked and not new_is_locked:
+            """
+            Default behavior before changes for locked datasets.
+            """
+            if newname != oldname:
+                # This is disruptive change. Share is actually being removed and replaced.
+                # Forcibly closes any existing SMB sessions.
+                await self.close_share(oldname)
+                try:
+                    await self.middleware.call('sharing.smb.reg_delshare', oldname)
+                except Exception:
+                    self.logger.warning('Failed to remove stale share [%s]',
+                                        old['name'], exc_info=True)
+                await self.middleware.call('sharing.smb.reg_addshare', new)
+            else:
+                diff = await self.middleware.call(
+                    'sharing.smb.diff_middleware_and_registry', new['name'], new
+                )
+                share_name = new['name'] if not new['home'] else 'homes'
+                await self.middleware.call('sharing.smb.apply_conf_diff',
+                                           'REGISTRY', share_name, diff)
+
+        elif old_is_locked and not new_is_locked:
+            """
+            Since the old share was not in our running configuration, we need
+            to add it.
+            """
+            await self.middleware.call('sharing.smb.reg_addshare', new)
+
+        elif not old_is_locked and new_is_locked:
             try:
                 await self.middleware.call('sharing.smb.reg_delshare', oldname)
             except Exception:
-                self.logger.warning('Failed to remove stale share [%s]',
+                self.logger.warning('Failed to remove locked share [%s]',
                                     old['name'], exc_info=True)
-            await self.middleware.call('sharing.smb.reg_addshare', new)
-        else:
-            diff = await self.middleware.call(
-                'sharing.smb.diff_middleware_and_registry', new['name'], new
-            )
-            share_name = new['name'] if not new['home'] else 'homes'
-            await self.middleware.call('sharing.smb.apply_conf_diff',
-                                       'REGISTRY', share_name, diff)
 
         if enable_aapl:
             await self._service_change('cifs', 'restart')
