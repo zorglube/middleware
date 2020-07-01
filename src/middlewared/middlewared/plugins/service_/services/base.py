@@ -13,6 +13,7 @@ class ServiceInterface:
     name = NotImplemented
 
     etc = []
+    etc_on_reload = True
     restartable = False  # Implements `restart` method instead of `stop` + `start`
     reloadable = False  # Implements `reload` method
 

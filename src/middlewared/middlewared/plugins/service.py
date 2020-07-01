@@ -224,7 +224,8 @@ class ServiceService(CRUDService):
 
         await self.middleware.call_hook('service.pre_action', service, 'reload', options)
 
-        await self.middleware.call('service.generate_etc', service_object)
+        if service_object.etc_on_reload:
+            await self.middleware.call('service.generate_etc', service_object)
 
         if service_object.reloadable:
             await service_object.before_reload()
