@@ -380,6 +380,9 @@ class DirectoryServices(Service):
             self.logger.warning("Failed to clear the SMB gencache after re-initializing "
                                 "directory services: [%s]", gencache_flush.stderr.decode())
 
+        await self.middleware.call('etc.generate', 'nss')
+        await self.middleware.call('kerberos.start')
+
 
 def setup(middleware):
     middleware.event_register('directoryservices.status', 'Sent on directory service state changes.')
