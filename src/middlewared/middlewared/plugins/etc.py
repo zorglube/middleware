@@ -228,11 +228,11 @@ class EtcService(Service):
             {'type': 'mako', 'path': 'local/rsyncd.conf', 'checkpoint': 'pool_import'}
         ],
         'smb': [
-            {'type': 'mako', 'path': 'local/smb4.conf', 'checkpoint': 'pool_import'},
-            {'type': 'mako', 'path': 'security/pam_winbind.conf', 'checkpoint': 'pool_import'},
+            {'type': 'mako', 'path': 'local/smb4.conf'},
+            {'type': 'mako', 'path': 'security/pam_winbind.conf'},
         ],
         'smb_share': [
-            {'type': 'mako', 'path': 'local/smb4_share.conf', 'checkpoint': 'pool_import'},
+            {'type': 'mako', 'path': 'local/smb4_share.conf'},
         ],
         'snmpd': [
             {'type': 'mako', 'path': 'local/snmpd.conf' if osc.IS_FREEBSD else 'snmp/snmpd.conf',
