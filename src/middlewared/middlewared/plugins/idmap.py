@@ -457,7 +457,7 @@ class IdmapDomainService(CRUDService):
             Int('certificate', null=True),
             Dict(
                 'options',
-                Str('schema_mode'),
+                Str('schema_mode', enum=['RFC2307', 'SFU', 'SFU20']),
                 Bool('unix_primary_group'),
                 Bool('unix_nss_info'),
                 Int('rangesize', validators=[Range(min=10000, max=1000000000)]),
@@ -470,10 +470,10 @@ class IdmapDomainService(CRUDService):
                 Str('ssl', enum=[x.value for x in SSL]),
                 Str('linked_service', enum=['LOCAL_ACCOUNT', 'LDAP', 'NIS']),
                 Str('ldap_server'),
-                Str('ldap_realm'),
+                Bool('ldap_realm'),
                 Str('bind_path_user'),
                 Str('bind_path_group'),
-                Str('user_cn'),
+                Bool('user_cn'),
                 Str('cn_realm'),
                 Str('ldap_domain'),
                 Str('ldap_url'),
@@ -646,7 +646,7 @@ class IdmapDomainService(CRUDService):
                         'generate LDAP traffic. Certificates do not apply.')
         verrors.check()
         await self.prune_keys(new)
-        final_options = IdmapBackend[data['idmap_backend']].defaults()
+        final_options = IdmapBackend[new['idmap_backend']].defaults()
         final_options.update(new['options'])
         new['options'] = final_options
         await self.idmap_compress(new)
