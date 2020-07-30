@@ -42,6 +42,7 @@ class IdmapBackend(enum.Enum):
             'unix_primary_group': {"required": False, "default": False},
             'unix_nss_info': {"required": False, "default": False},
         },
+        'has_secrets': False,
         'services': ['AD'],
     }
     AUTORID = {
@@ -55,6 +56,7 @@ class IdmapBackend(enum.Enum):
             'readonly': {"required": False, "default": False},
             'ignore_builtin': {"required": False, "default": False},
         },
+        'has_secrets': False,
         'services': ['AD'],
     }
     LDAP = {
@@ -67,6 +69,7 @@ class IdmapBackend(enum.Enum):
             'ssl': {"required": False, "default": SSL.NOSSL.value},
             'readonly': {"required": False, "default": False},
         },
+        'has_secrets': True,
         'services': ['AD', 'LDAP'],
     }
     NSS = {
@@ -76,6 +79,7 @@ class IdmapBackend(enum.Enum):
         'parameters': {
             'linked_service': {"required": False, "default": "LOCAL_ACCOUNT"},
         },
+        'has_secrets': False,
         'services': ['AD'],
     }
     RFC2307 = {
@@ -92,10 +96,10 @@ class IdmapBackend(enum.Enum):
             'ldap_domain': {"required": False, "default": None},
             'ldap_url': {"required": False, "default": None},
             'ldap_user_dn': {"required": True, "default": None},
-            'ldap_user_dn_password': {"required": True, "default": None},
             'ldap_realm': {"required": False, "default": None},
             'ssl': {"required": False, "default": SSL.NOSSL.value},
         },
+        'has_secrets': True,
         'services': ['AD', 'LDAP'],
     }
     RID = {
@@ -105,6 +109,7 @@ class IdmapBackend(enum.Enum):
         'parameters': {
             'sssd_compat': {"required": False, "default": False},
         },
+        'has_secrets': False,
         'services': ['AD'],
     }
     TDB = {
@@ -147,6 +152,9 @@ class IdmapBackend(enum.Enum):
 
         return ret
 
+    def requires_secret(self):
+        return self.value['has_secrets']
+
 
 class IdmapDomainModel(sa.Model):
     __tablename__ = 'directoryservice_idmap_domain'
@@ -159,6 +167,7 @@ class IdmapDomainModel(sa.Model):
     idmap_domain_idmap_backend = sa.Column(sa.String(120), default='rid')
     idmap_domain_options = sa.Column(sa.JSON(type=dict))
     idmap_domain_certificate_id = sa.Column(sa.ForeignKey('system_certificate.id'), index=True, nullable=True)
+    idmap_domain_secret = sa.Column(sa.EncryptedText())
 
 
 class IdmapDomainService(CRUDService):
@@ -378,12 +387,30 @@ class IdmapDomainService(CRUDService):
         return IdmapBackend.ds_choices()
 
     @private
+    async def set_secret(self, domain, secret):
+        pwchg = await run([SMBCmd.NET.value, 'idmap', 'set', 'secret', domain, secret],
+                          check=False)
+        if pwchg.returncode != 0:
+            raise CallError("Failed to change idmap password for domain [%s]: %s",
+                            domain, pwch.stderr.decode().strip())
+
+    @private
     async def validate(self, schema_name, data, verrors):
         if data['name'] in [DSType.DS_TYPE_LDAP.name, DSType.DS_TYPE_DEFAULT_DOMAIN.name]:
             if data['idmap_backend'] not in (await self.backend_choices())['LDAP']:
                 verrors.add(f'{schema_name}.idmap_backend',
                             f'idmap backend [{data["idmap_backend"]}] is not appropriate. '
                             f'for the system domain type {data["name"]}')
+
+        if data.get('idmap_pw') and not IdmapBackend['idmap_backend'].requres_secret():
+            verrors.add(f'{schema_name}.idmap_pw',
+                        f'The {data["idmap_backend"]} idmap backend does not '
+                        'store a unique password for LDAP communication.')
+
+        if not data.get('idmap_pw') and IdmapBackend['idmap_backend'].requres_secret():
+            verrors.add(f'{schema_name}.idmap_pw',
+                        f'The {data["idmap_backend"]} idmap backend requires '
+                        'that a unique password be stored for LDAP communication.')
 
         if data['range_high'] < data['range_low']:
             verrors.add(f'{schema_name}.range_low', 'Idmap high range must be greater than idmap low range')
@@ -454,6 +481,7 @@ class IdmapDomainService(CRUDService):
             Int('range_low', required=True, validators=[Range(min=1000, max=2147483647)]),
             Int('range_high', required=True, validators=[Range(min=1000, max=2147483647)]),
             Str('idmap_backend', enum=[x.name for x in IdmapBackend]),
+            Str('idmap_pw', private=True),
             Int('certificate', null=True),
             Dict(
                 'options',
@@ -465,7 +493,6 @@ class IdmapDomainService(CRUDService):
                 Bool('ignore_builtin'),
                 Str('ldap_base_dn'),
                 Str('ldap_user_dn'),
-                Str('ldap_user_dn_password'),
                 Str('ldap_url'),
                 Str('ssl', enum=[x.value for x in SSL]),
                 Str('linked_service', enum=['LOCAL_ACCOUNT', 'LDAP', 'NIS']),
@@ -500,6 +527,10 @@ class IdmapDomainService(CRUDService):
         depends on the environment in which the NAS is deployed.
 
         `range_low` and `range_high` specify the UID and GID range for which this backend is authoritative.
+
+        `idmap_pw` specifies the password to be used by idmap backends that may require separate credentials in
+        order to communication with a remote LDAP server. This parameter is valid for LDAP and RFC2307 idmap
+        backends.
 
         `certificate_id` references the certificate ID of the SSL certificate to use for certificate-based
         authentication to a remote LDAP server. This parameter is not supported for all idmap backends as some
@@ -592,6 +623,9 @@ class IdmapDomainService(CRUDService):
                         'generate LDAP traffic. Certificates do not apply.')
         verrors.check()
 
+        if data.get('idmap_pw'):
+            await self.set_secret(data['name'], data['idmap_pw'])
+
         final_options = IdmapBackend[data['idmap_backend']].defaults()
         final_options.update(data['options'])
         data['options'] = final_options
@@ -649,6 +683,10 @@ class IdmapDomainService(CRUDService):
         final_options = IdmapBackend[new['idmap_backend']].defaults()
         final_options.update(new['options'])
         new['options'] = final_options
+
+        if new.get('idmap_pw') and new['idmap_pw'] != old['idmap_pw']:
+            await self.set_secret(new['name'], new['idmap_pw'])
+
         await self.idmap_compress(new)
         await self.middleware.call(
             'datastore.update',
