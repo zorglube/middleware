@@ -12,6 +12,8 @@ from middlewared.service_exception import CallError
 from middlewared.utils import run
 from samba.dcerpc.messaging import MSG_WINBIND_OFFLINE, MSG_WINBIND_ONLINE
 
+DS_LOADED = False
+
 
 class DSStatus(enum.Enum):
     DISABLED = enum.auto()
@@ -167,7 +169,11 @@ class DirectoryServices(Service):
         }
         ds_state.update(await self.get_state())
         ds_state.update(new)
-        self.middleware.send_event('directoryservices.status', 'CHANGED', fields=ds_state)
+
+        if DS_LOADED:
+            self.middleware.send_event('directoryservices.status',
+                                       'CHANGED', fields=ds_state)
+
         return await self.middleware.call('cache.put', 'DS_STATE', ds_state)
 
     @accepts()
@@ -416,4 +422,6 @@ class DirectoryServices(Service):
 
 
 def setup(middleware):
+    global DS_LOADED
     middleware.event_register('directoryservices.status', 'Sent on directory service state changes.')
+    DS_LOADED = True
