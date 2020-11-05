@@ -8,7 +8,9 @@ from .schema import get_schema, get_list_item_from_value, update_conditional_val
 from .utils import RESERVED_NAMES
 
 
-validation_mapping = {}
+validation_mapping = {
+    'validations/hostPort': 'host_port_and_update_strategy'
+}
 
 
 class ChartReleaseService(Service):
@@ -54,14 +56,16 @@ class ChartReleaseService(Service):
         # If schema is okay, we see if we have question specific validation to be performed
         questions = {v['variable']: v for v in item_version_details['schema']['questions']}
         for key in new_values:
-            await self.validate_question(verrors, new_values[key], questions[key], dict_obj.attrs[key], schema_name)
+            await self.validate_question(
+                verrors, new_values[key], questions[key], dict_obj.attrs[key], schema_name, new_values
+            )
 
         verrors.check()
 
         return dict_obj
 
     @private
-    async def validate_question(self, verrors, value, question, var_attr, schema_name):
+    async def validate_question(self, verrors, value, question, var_attr, schema_name, complete_config):
         schema = question['schema']
         schema_name = f'{schema_name}.{question["variable"]}'
 
@@ -70,7 +74,7 @@ class ChartReleaseService(Service):
             dict_attrs = {v['variable']: v for v in schema['attrs']}
             for k in filter(lambda k: k in dict_attrs, value):
                 await self.validate_question(
-                    verrors, value[k], dict_attrs[k], var_attr.attrs[k], f'{schema_name}.{k}',
+                    verrors, value[k], dict_attrs[k], var_attr.attrs[k], f'{schema_name}.{k}', complete_config,
                 )
 
         elif schema['type'] == 'list' and value:
@@ -78,12 +82,24 @@ class ChartReleaseService(Service):
                 item_index, attr = get_list_item_from_value(item, var_attr)
                 if attr:
                     await self.validate_question(
-                        verrors, item, schema['items'][item_index], attr, f'{schema_name}.{index}'
+                        verrors, item, schema['items'][item_index], attr, f'{schema_name}.{index}', complete_config,
                     )
 
         for validator_def in filter(lambda k: k in validation_mapping, schema.get('$ref', [])):
             await self.middleware.call(
-                f'chart.release.validate_{validation_mapping[validator_def]}', verrors, value, question, schema_name,
+                f'chart.release.validate_{validation_mapping[validator_def]}', verrors, value,
+                question, schema_name, complete_config,
             )
 
         return verrors
+
+    @private
+    async def validate_host_port_and_update_strategy(self, verrors, value, question, schema_name, complete_config):
+        if not value or not complete_config.get('updateStrategy') or complete_config['updateStrategy'] != 'Recreate':
+            return
+
+        verrors.add(
+            f'{schema_name}',
+            'Update strategy must be "Recreate" when using host ports as updating chart release will have pods stuck'
+            'in pending state failing to acquire already used port.'
+        )
