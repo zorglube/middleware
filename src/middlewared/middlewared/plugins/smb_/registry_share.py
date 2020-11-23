@@ -66,7 +66,7 @@ class SharingSMBService(Service):
 
     @private
     async def reg_listshares(self):
-        return (await self.netconf(action='listshares')).splitlines()
+        return (await self.netconf(action='listshares')).splitlines()[1:]
 
     @private
     async def reg_addshare(self, data):
@@ -113,7 +113,7 @@ class SharingSMBService(Service):
     async def reg_getparm(self, share, parm):
         to_list = ['vfs objects', 'hosts allow', 'hosts deny']
         try:
-            ret = await self.netconf(action='getparm', share=share, args=[parm])
+            ret = (await self.netconf(action='getparm', share=share, args=[parm])).strip()
         except CallError as e:
             if f"Error: given parameter '{parm}' is not set." in e.errmsg:
                 # Copy behavior of samba python binding
@@ -314,6 +314,7 @@ class SharingSMBService(Service):
             "streams": True if "streams_xattr" in vfs_objects else False,
             "timemachine": conf_in.pop("fruit:time machine", False),
             "recyclebin": True if "recycle" in vfs_objects else False,
+            "cluster_volname": conf_in.pop("glusterfs: volume", ""),
             "fsrvp": False,
             "enabled": True,
             "locked": False,
@@ -371,6 +372,9 @@ class SharingSMBService(Service):
             data['vfsobjects'].append('noacl')
         else:
             conf["nt acl support"] = "no"
+
+        if data["cluster_volname"]:
+            conf["glusterfs: volume"] = data["cluster_volume"]
 
         if data['recyclebin']:
             # crossrename is required for 'recycle' to work across sub-datasets

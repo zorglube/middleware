@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import uuid
+from bidict import bidict
 
 try:
     from samba.samba3 import param
@@ -22,19 +23,16 @@ except ImportError:
     param = None
 
 
-LOGLEVEL_MAP = {
+LOGLEVEL_MAP = bidict({
     '0': 'NONE',
     '1': 'MINIMUM',
     '2': 'NORMAL',
     '3': 'FULL',
     '10': 'DEBUG',
-}
+})
 RE_NETBIOSNAME = re.compile(r"^[a-zA-Z0-9\.\-_!@#\$%^&\(\)'\{\}~]{1,15}$")
 
 LP_CTX = param.get_context()
-
-# placeholder for proper ctdb health check
-CLUSTER_IS_HEALTHY = True
 
 
 class SMBHAMODE(enum.IntEnum):
@@ -46,7 +44,7 @@ class SMBHAMODE(enum.IntEnum):
     STANDALONE = 0
     LEGACY = 1
     UNIFIED = 2
-    CLUSTERED = 2
+    CLUSTERED = 3
 
 
 class SMBCmd(enum.Enum):
@@ -337,25 +335,28 @@ class SMBService(SystemServiceService):
         return True
 
     @private
-    def getparm(self, parm, section):
+    async def getparm(self, parm, section):
         """
         Get a parameter from the smb4.conf file. This is more reliable than
         'testparm --parameter-name'. testparm will fail in a variety of
         conditions without returning the parameter's value.
         """
+        ret = None
         try:
-            if section.upper() == 'GLOBAL':
-                try:
-                    LP_CTX.load(SMBPath.GLOBALCONF.platform())
-                except Exception as e:
-                    self.logger.warning("Failed to reload smb.conf: %s", e)
-
-                return LP_CTX.get(parm)
-            else:
-                return self.middleware.call_sync('sharing.smb.reg_getparm', section, parm)
-
+            ret  = await self.middleware.call('sharing.smb.reg_getparm', section, parm)
         except Exception as e:
-            raise CallError(f'Attempt to query smb4.conf parameter [{parm}] failed with error: {e}')
+            if not section.upper() == 'GLOBAL':
+                raise CallError(f'Attempt to query smb4.conf parameter [{parm}] failed with error: {e}')
+
+        if ret:
+            return ret
+
+        try:
+            LP_CTX.load(SMBPath.GLOBALCONF.platform())
+        except Exception as e:
+            self.logger.warning("Failed to reload smb.conf: %s", e)
+
+        return LP_CTX.get(parm)
 
     @private
     def set_passdb_backend(self, backend_type):
@@ -436,9 +437,38 @@ class SMBService(SystemServiceService):
         do not exist or have incorrect permissions.
         """
         data = await self.config()
+        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
         job.set_progress(0, 'Setting up SMB directories.')
         if create_paths:
             await self.setup_directories()
+
+        job.set_progress(10, 'Generating stub SMB config.')
+        await self.middleware.call('etc.generate', 'smb')
+
+        """
+        smb4.conf registry setup. The smb config is split between five
+        different middleware plugins (smb, idmap, ad, ldap, sharing.smb).
+        This initializes them in the above order so that configuration errors
+        do not occur.
+        """
+        job.set_progress(25, 'generating SMB, idmap, and directory service config.')
+        await self.middleware.call('smb.initialize_globals')
+
+        if ha_mode == SMBHAMODE.CLUSTERED:
+            ad_enabled = (await self.middleware.call('smb.getparm', 'security', 'global')) == 'ADS'
+            ldap_enabled = (await self.middleware.call('directoryservices.get_conf', 'directoryservice.ldap'))['enable']
+            await self.middleware.call('idmap.ctdb_setup')
+        else:
+            ad_enabled = (await self.middleware.call('activedirectory.config'))['enable']
+            ldap_enabled = (await self.middleware.call('ldap.config'))['enable']
+            await self.middleware.call('idmap.synchronize')
+
+        if ad_enabled:
+            await self.middleware.call('activedirectory.synchronize')
+            await self.middleware.call('idmap.synchronize')
+        elif ldap_enabled:
+            await self.middleware.call('ldap.synchronize')
+            await self.middleware.call('idmap.synchronize')
 
         job.set_progress(30, 'Setting up server SID.')
         await self.middleware.call('smb.set_sid', data['cifs_SID'])
@@ -448,8 +478,11 @@ class SMBService(SystemServiceService):
         will provide the SMB users and groups. We skip these steps to avoid having
         samba potentially try to write our local users and groups to the remote
         LDAP server.
+
+        Local users and groups are skipped on clustered servers for now.
         """
-        if await self.middleware.call("smb.getparm", "passdb backend", "global") == "tdbsam":
+        passdb_backend = await self.middleware.call('smb.getparm', 'passdb backend', 'global')
+        if ha_mode != SMBHAMODE.CLUSTERED and passdb_backend == "tdbsam":
             job.set_progress(40, 'Synchronizing passdb and groupmap.')
             await self.middleware.call('etc.generate', 'user')
             pdb_job = await self.middleware.call("smb.synchronize_passdb")
@@ -461,13 +494,11 @@ class SMBService(SystemServiceService):
         """
         The following steps ensure that we cleanly import our SMB shares
         into the registry.
+        This step is not required when underlying database is clustered (cluster node should
+        just recover with info from other nodes on reboot).
         """
         job.set_progress(60, 'generating SMB share configuration.')
-        await self.middleware.call('cache.put', 'SMB_REG_INITIALIZED', False)
-        await self.middleware.call("etc.generate", "smb_share")
-        await self.middleware.call("smb.import_conf_to_registry")
-        await self.middleware.call('cache.put', 'SMB_REG_INITIALIZED', True)
-        os.unlink(SMBPath.SHARECONF.platform())
+        await self.middleware.call('sharing.smb.sync_registry')
 
         """
         It is possible that system dataset was migrated or an upgrade
@@ -616,6 +647,14 @@ class SMBService(SystemServiceService):
             except (ValueError, TypeError):
                 verrors.add(f'smb_update.{i}', 'Not a valid mask')
 
+    @private
+    async def config(self):
+        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
+        if ha_mode != SMBHAMODE.CLUSTERED:
+            return await super().config()
+
+        return await self.middleware.call('smb.reg_config')
+
     @accepts(Dict(
         'smb_update',
         Str('netbiosname', max_length=15),
@@ -644,20 +683,30 @@ class SMBService(SystemServiceService):
 
         `netbiosname` defaults to the original hostname of the system.
 
-        `workgroup` and `netbiosname` should have different values.
+        `netbiosalias` a list of netbios aliases. If Server is joined to an AD domain, additional Kerberos
+        Service Principal Names will be generated for these aliases.
+
+        `workgroup` specifies the NetBIOS workgroup to which the TrueNAS server belongs. This will be automatically
+        set to the correct value during the process of joining an AD domain. `workgroup` and `netbiosname` should have different values.
 
         `enable_smb1` allows legacy SMB clients to connect to the server when enabled.
 
-        `localmaster` when set, determines if the system participates in a browser election.
+        `aapl_extensions` enables support for SMB2 protocol extensions for MacOS clients. This is not a requirement for MacOS support,
+        but is currently a requirement for time machine support.
 
-        `domain_logons` is used to provide netlogin service for older Windows clients if enabled.
+        `localmaster` when set, determines if the system participates in a browser election.
 
         `guest` attribute is specified to select the account to be used for guest access. It defaults to "nobody".
 
-        `nullpw` when enabled allows the users to authorize access without a password.
+        The group specified as the SMB `admin_group` will be automatically added as a foreign group member of S-1-5-32-544 (builtin\admins).
+        This will afford the group all privileges granted to a local admin. Any SMB group may be selected (including AD groups).
 
-        `hostlookup` when enabled, allows using hostnames rather then IP addresses in "hostsallow"/"hostsdeny" fields
-        of SMB Shares.
+        `ntlmv1_auth` enables a legacy and insecure authentication method, which may be required for legacy or poorly-implemented
+        SMB clients.
+
+        `smb_options` smb.conf parameters that are not covered by the above supported configuration options may be added as
+        an smb_option. Not all options are tested or supported, and behavior of smb_options may change between releases. Stability of
+        smb.conf options is not guaranteed.
         """
         old = await self.config()
 
@@ -686,9 +735,21 @@ class SMBService(SystemServiceService):
                 new['loglevel'] = k
                 break
 
-        await self.compress(new)
+        new['netbiosalias'] = ' '.join(new['netbiosalias'])
 
-        await self._update_service(old, new)
+        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
+        if ha_mode != SMBHAMODE.CLUSTERED:
+            await self.middleware.call('smb.reg_update', new)
+            await self.compress(new)
+            await self._update_service(old, new)
+        else:
+            ctdb_healthy = await self.middleware.call('ctdb.general.healthy')
+            if not ctdb_healthy:
+                raise CallError("SMB configuration changes not permitted while cluster is unhealthy")
+
+            await self.middleware.call('smb.reg_update', new)
+            await self._service_change(self._config.service, 'restart')
+
         await self.reset_smb_ha_mode()
 
         """
@@ -702,7 +763,6 @@ class SMBService(SystemServiceService):
 
     @private
     async def compress(self, data):
-        data['netbiosalias'] = ' '.join(data['netbiosalias'])
         data.pop('netbiosname_local', None)
         data.pop('next_rid')
         return data
@@ -816,8 +876,10 @@ class SharingSMBService(SharingService):
         `auxsmbconf` is a string of additional smb4.conf parameters not covered by the system's API.
         """
         ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
-        if ha_mode == SMBHAMODE.CLUSTERED and CLUSTER_IS_HEALTHY is False:
-            raise CallError("SMB share changes not permitted while cluster is unhealthy")
+        if ha_mode == SMBHAMODE.CLUSTERED:
+            ctdb_healthy = await self.middleware.call('ctdb.general.healthy')
+            if not ctdb_healthy:
+                raise CallError("SMB configuration changes not permitted while cluster is unhealthy")
 
         verrors = ValidationErrors()
         path = data['path']
@@ -873,8 +935,10 @@ class SharingSMBService(SharingService):
         Update SMB Share of `id`.
         """
         ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
-        if ha_mode == SMBHAMODE.CLUSTERED and CLUSTER_IS_HEALTHY is False:
-            raise CallError("SMB share changes not permitted while cluster is unhealthy")
+        if ha_mode == SMBHAMODE.CLUSTERED:
+            ctdb_healthy = await self.middleware.call('ctdb.general.healthy')
+            if not ctdb_healthy:
+                raise CallError("SMB share changes not permitted while cluster is unhealthy.")
 
         verrors = ValidationErrors()
         path = data.get('path')
@@ -1010,8 +1074,10 @@ class SharingSMBService(SharingService):
         that are accessing the share.
         """
         ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
-        if ha_mode == SMBHAMODE.CLUSTERED and CLUSTER_IS_HEALTHY is False:
-            raise CallError("SMB share changes not permitted while cluster is unhealthy")
+        if ha_mode == SMBHAMODE.CLUSTERED:
+            ctdb_healthy = await self.middleware.call('ctdb.general.healthy')
+            if not ctdb_healthy:
+                raise CallError("SMB share changes not permitted while cluster is unhealthy.")
 
         if ha_mode != SMBHAMODE.CLUSTERED:
             share = await self._get_instance(id)

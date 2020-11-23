@@ -3,6 +3,7 @@ import json
 import os
 import struct
 import tdb
+import errno
 
 from base64 import b64encode, b64decode
 from middlewared.schema import accepts
@@ -11,6 +12,17 @@ from middlewared.plugins.smb import SMBCmd, SMBPath
 from middlewared.service_exception import CallError
 from middlewared.utils import run
 from samba.dcerpc.messaging import MSG_WINBIND_OFFLINE, MSG_WINBIND_ONLINE
+
+DEFAULT_AD_CONF = {
+    "id": 1,
+    "bindname": "",
+    "verbose_logging": False,
+    "kerberos_principal": "",
+    "kerberos_realm": None,
+    "createcomputer": "",
+    "disable_freenas_cache": False,
+    "restrict_pam": False
+}
 
 
 class DSStatus(enum.Enum):
@@ -91,6 +103,18 @@ class DirectorySecrets(object):
             raise CallError(f"Failed to ldap secrets: {e}")
 
         self.tdb.transaction_commit()
+
+    def set_conf(self, schema, conf):
+        tdb_key = f'SECRETS/TRUENAS/{schema.upper()}'.encode()
+        tdb_data = conf.encode() + b"\x00"
+        try:
+            self.tdb.store(tdb_key, tdb_data)
+        except Exception as e:
+            raise CallError(f"Failed to set {schema} config: {e}")
+
+    def get_conf(self, schema):
+        rv = self.tdb.get(f"SECRETS/TRUENAS/{schema.upper()}".encode())
+        return rv
 
     def dump(self):
         ret = {}
@@ -345,6 +369,34 @@ class DirectoryServices(Service):
         return {"dbconfig": stored_ts, "secrets": passwd_ts}
 
     @private
+    def get_conf(self, schema, ha_mode=None):
+        if ha_mode is None:
+            ha_mode = self.middleware.call_sync('smb.get_smb_ha_mode')
+        with DirectorySecrets(logger=self.logger, ha_mode=ha_mode) as s:
+            conf = s.get_conf(schema)
+
+        rv = conf.decode()
+        if not rv:
+            if schema == "directoryservice.activedirectory":
+                return DEFAULT_AD_CONF
+            elif schema == "directoryservice.ldap":
+                return {}
+            else:
+                raise CallError(f"Schema {schema} does not exist in secrets", errno.ENOENT)
+
+        return json.loads(rv[:-1])
+
+    @private
+    def set_conf(self, schema, data, ha_mode=None):
+        if ha_mode is None:
+            ha_mode = self.middleware.call_sync('smb.get_smb_ha_mode')
+
+        with DirectorySecrets(logger=self.logger, ha_mode=ha_mode) as s:
+            s.set_conf(schema, json.dumps(data))
+
+        return True
+
+    @private
     def available_secrets(self):
         """
         Entries in the secrets backup are keyed according to machine account name,
@@ -400,7 +452,7 @@ class DirectoryServices(Service):
         elif ldap_enabled and not has_secrets and ldap_conf["has_samba_schema"]:
             self.logger.warning("LDAP SMB secrets database does not exist. "
                                 "attempting to restore secrets from configuration file.")
-            self.middleware.call("smb.store_ldap_admin_password")
+            await self.middleware.call("smb.store_ldap_admin_password")
 
         if ldap_enabled and ldap_conf['kerberos_realm']:
             is_kerberized = True
