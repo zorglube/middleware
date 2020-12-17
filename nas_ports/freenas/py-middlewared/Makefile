@@ -84,7 +84,6 @@ RUN_DEPENDS=	${PYTHON_PKGNAMEPREFIX}ws4py>0:www/py-ws4py@${PY_FLAVOR} \
 		grub2-x86_64-efi>0:sysutils/grub2-x86_64-efi \
 		squashfs-tools>0:sysutils/squashfs-tools \
 		${PYTHON_PKGNAMEPREFIX}packaging>0:devel/py-packaging@${PY_FLAVOR} \
-		rclone>0:net/rclone \
 		ifstat>0:net/ifstat \
 		iftop>0:net-mgmt/iftop \
 		intel-pcm>0:sysutils/intel-pcm \
