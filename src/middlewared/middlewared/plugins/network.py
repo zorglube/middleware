@@ -156,6 +156,13 @@ class NetworkConfigurationService(ConfigService):
 
         return verrors
 
+    @private
+    async def restart_service_announcements(self):
+        service_announcement = (await self.config())['service_announcement']
+        for srv, enabled in service_announcement.items():
+            if enabled:
+                await self.middleware.call("service.restart", ANNOUNCE_SRV[srv])
+
     @accepts(
         Dict(
             'global_configuration_update',

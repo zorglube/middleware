@@ -1272,6 +1272,7 @@ class JailService(CRUDService):
         else:
             raise CallError(f'{jail} is already running')
 
+        self.middleware.call_sync("network.configuration.restart_service_announcements")
         return True
 
     @accepts(Str("jail"), Bool('force', default=False))
@@ -1290,6 +1291,7 @@ class JailService(CRUDService):
             raise CallError(f'{jail} is not running')
 
             return True
+        self.middleware.call_sync("network.configuration.restart_service_announcements")
 
     @accepts(Str('jail'))
     @job(lock=lambda args: f"jail_restart:{args[0]}")
@@ -1309,6 +1311,7 @@ class JailService(CRUDService):
         except Exception as e:
             raise CallError(str(e))
 
+        self.middleware.call_sync("network.configuration.restart_service_announcements")
         return True
 
     @private
