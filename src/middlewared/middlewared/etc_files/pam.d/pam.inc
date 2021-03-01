@@ -45,14 +45,14 @@
 
         def pam_auth(self):
             module = self.pam_winbind
-            args = ["try_first_pass", "krb5_auth", "krb5_ccache_type=FILE"]
+            args = ["use_first_pass", "krb5_auth", "krb5_ccache_type=FILE"]
             module_args = " ".join(args)
 
             return f"auth\t\tsufficient\t{module}\t{module_args}"
 
         def pam_account(self):
             module = self.pam_winbind
-            args = ["krb5_auth", "krb5_ccache_type=FILE"]
+            args = ["use_first_pass", "krb5_auth", "krb5_ccache_type=FILE"]
             module_args = " ".join(args)
 
             return f"account\t\tsufficient\t{module}\t{module_args}"
