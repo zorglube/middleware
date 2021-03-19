@@ -97,6 +97,32 @@ class SMB(object):
         }
         return f
 
+    def _convert_ace(self, ace):
+        return {
+            "trustee": str(ace.trustee),
+            "type": ace.type,
+            "access_mask": ace.access_mask,
+            "flags": ace.flags,
+        }
+
+    def get_acl(self, file):
+        theacl = self._connection.get_acl(
+            file,
+            security.SECINFO_OWNER | security.SECINFO_GROUP | security.SECINFO_DACL,
+            security.SEC_FLAG_MAXIMUM_ALLOWED
+        )
+        return {
+            "sddl": theacl.as_sddl(),
+            "owner_sid": str(theacl.owner_sid),
+            "group_sid": str(theacl.group_sid),
+            "dacl": {
+                "revision": theacl.dacl.revision,
+                "num_aces": theacl.dacl.num_aces,
+                "aces": [self._convert_ace(ace) for ace in theacl.dacl.aces],
+                "size": theacl.dacl.size,
+            }
+        }
+
     def close(self, idx, delete=False):
         if delete:
             self._connection.delete_on_close(
