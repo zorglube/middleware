@@ -5,6 +5,7 @@ from middlewared.service import accepts, job, private, SharingService, SystemSer
 from middlewared.service_exception import CallError
 import middlewared.sqlalchemy as sa
 from middlewared.utils import osc, Popen, run
+from middlewared.plugins.smb_.impl import VFSOPS 
 
 import asyncio
 import codecs
@@ -1140,6 +1141,17 @@ class SharingSMBService(SharingService):
                     f'{kv[0]} is a blacklisted auxiliary parameter. Changes to this parameter '
                     'are not permitted.'
                 )
+
+            if kv[0].strip() in ['full_audit:success', 'full_audit:failure']:
+                if kv[1].strip() not in ['all', 'none']:
+                    for op in kv[1].split():
+                        try:
+                            VFSOPS(op.strip())
+                        except ValueError:
+                            verrors.add(
+                                f'{schema_name}.auxsmbconf'
+                                f'full_audit: [{op}] is not a valid VFS operation.'
+                            )
 
             if schema_name == 'smb_update.smb_options' and ':' not in kv[0]:
                 """
