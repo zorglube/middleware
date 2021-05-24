@@ -56,8 +56,8 @@ hardware_linux()
 
 	section_footer
 
-	section_header "lspci -vvvD"
-	lspci -vvvD
+	section_header "lspci -vvvnnD"
+	lspci -vvvnnD
 	section_footer
 
 	section_header "usb-devices"
