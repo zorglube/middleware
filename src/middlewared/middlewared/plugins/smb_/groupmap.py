@@ -16,6 +16,11 @@ class SMBService(Service):
         service_verb = 'restart'
 
     @private
+    async def has_legacy_groupmap(self):
+        legacy_gm = await self.middleware.call('smb.getparm', 'groupmap:legacy', 'GLOBAL')
+        return bool(legacy_gm)
+
+    @private
     async def groupmap_list(self):
         groupmap = {}
         out = await run([SMBCmd.NET.value, 'groupmap', 'list'], check=False)
@@ -28,6 +33,50 @@ class SMBService(Service):
                 groupmap[entry['unixgroup']] = entry
 
         return groupmap
+
+    @private
+    async def add_new_local_group(self, group, sid):
+        # Internal samba function to generate builtins will typically
+        # do this in order BA, BU, BG (ascending order by RID starting at 544)
+        offset = int((sid.split("-")[-1])) - 544
+        dom_range = await self.middleware.call('smb.getparm', 'idmap config *: range', 'GLOBAL')
+        dom_backend = await self.middleware.call('smb.getparm', 'idmap config *: backend', 'GLOBAL')
+        if dom_backend != 'tdb':
+            return False
+
+        low_range = int(dom_range.split('-')[0].strip())
+        gid = low_range + offset
+        await self.middleware.call('group.create_internal', {
+            'name': f'legacy_{group}',
+            'gid': gid,
+            'smb': False,
+            'sudo': False,
+            'sudo_nopasswd': False,
+            'sudo_commands': [],
+            'allow_duplicate_gid': False
+        }, True)
+
+        return True
+
+    @private
+    async def add_legacy_builtin_group(self, group):
+        unixgroup = f'legacy_{group}'
+        ntgroup = group[8:].capitalize()
+        sid = SMBBuiltin[ntgroup.upper()].value[1]
+        grp = await self.middleware.call('group.query', [('name', '=', f'legacy_{group}')])
+        if len(grp) == 0:
+            group_created = await self.add_new_local_group(group, sid)
+            if not group_created:
+                return
+        gm_add = await run([
+            SMBCmd.NET.value, '-d', '0', 'groupmap', 'add', f'sid={sid}',
+            'type=builtin', f'unixgroup={unixgroup}', f'ntgroup={ntgroup}'],
+            check=False
+        )
+        if gm_add.returncode != 0:
+            raise CallError(
+                f'Failed to generate groupmap for [{group}]: ({gm_add.stderr.decode()})'
+            )
 
     @private
     async def add_builtin_group(self, group):
@@ -59,6 +108,8 @@ class SMBService(Service):
             return
 
         if group in SMBBuiltin.unix_groups():
+            if await self.has_legacy_groupmap():
+                return await self.add_legacy_builtin_group(group)
             return await self.add_builtin_group(group)
 
         disallowed_list = ['USERS', 'ADMINISTRATORS', 'GUESTS']
