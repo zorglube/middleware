@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import uuid
+import threading
 
 try:
     from samba.samba3 import param
@@ -30,7 +31,28 @@ LOGLEVEL_MAP = {
 }
 RE_NETBIOSNAME = re.compile(r"^[a-zA-Z0-9\.\-_!@#\$%^&\(\)'\{\}~]{1,15}$")
 
-LP_CTX = param.get_context()
+LP_CTX = None 
+
+class LPCTX_WRAPPER(object):
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.lp_ctx = LP_CTX
+
+    def get_ctx(self):
+        if self.lp_ctx is None:
+            global LP_CTX
+            LP_CTX = param.get_context()
+            self.lp_ctx = LP_CTX
+            self.lp_ctx.load(SMBPath.GLOBALCONF.platform())
+
+        return self.lp_ctx
+
+    def __enter__(self):
+        self.lock.acquire()
+        return self
+    
+    def __exit__(self, typ, value, traceback):
+        self.lock.release()
 
 
 class SMBHAMODE(enum.IntEnum):
@@ -340,12 +362,17 @@ class SMBService(SystemServiceService):
         """
         try:
             if section.upper() == 'GLOBAL':
+                smbparam = None
                 try:
-                    LP_CTX.load(SMBPath.GLOBALCONF.platform())
+                    with LPCTX_WRAPPER() as lp:
+                        ctx = lp.get_ctx()
+                        #LP_CTX.load(SMBPath.GLOBALCONF.platform())
+                        self.logger.debug("LP_CTX: %s", hex(id(ctx)))
+                        smbparam = ctx.get(parm)
                 except Exception as e:
                     self.logger.warning("Failed to reload smb.conf: %s", e)
 
-                return LP_CTX.get(parm)
+                return smbparam 
             else:
                 return self.middleware.call_sync('sharing.smb.reg_getparm', section, parm)
 

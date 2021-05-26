@@ -14,7 +14,7 @@ import tdb
 import time
 
 from dns import resolver
-from middlewared.plugins.smb import SMBCmd, SMBPath, WBCErr
+from middlewared.plugins.smb import SMBCmd, SMBPath, WBCErr, LPCTX_WRAPPER
 from middlewared.schema import accepts, Bool, Dict, Int, List, Str
 from middlewared.service import job, private, ConfigService, Service, ValidationError, ValidationErrors
 from middlewared.service_exception import CallError
@@ -27,11 +27,9 @@ import middlewared.utils.osc as osc
 from samba.dcerpc.messaging import MSG_WINBIND_ONLINE
 from samba.credentials import Credentials
 from samba.net import Net
-from samba.samba3 import param
 from samba.dcerpc import (nbt, netlogon)
 from samba import (ntstatus, NTSTATUSError)
 
-LP_CTX = param.get_context()
 FEATURE_SEAL = 4
 
 
@@ -177,12 +175,12 @@ class ActiveDirectory_Conn(object):
         super(ActiveDirectory_Conn, self).__init__()
         self.ad = kwargs.get('conf')
         self.logger = kwargs.get('logger')
+        self.lp = kwargs.get('lpctx')
         self.cred = Credentials()
         self._init_creds()
-        self.netctx = Net(creds=self.cred, lp=LP_CTX)
+        self.netctx = Net(creds=self.cred, lp=self.lp)
 
     def _init_creds(self):
-        LP_CTX.load(SMBPath.GLOBALCONF.platform())
         self.cred.set_gensec_features(self.cred.get_gensec_features() | FEATURE_SEAL)
         self.cred.guess()
 
@@ -820,10 +818,13 @@ class ActiveDirectoryService(ConfigService):
             ad = self.middleware.call_sync('activedirectory.config')
 
         try:
-            pdc = ActiveDirectory_Conn(conf=ad, logger=self.logger).get_pdc()
-            if not pdc:
-                self.logger.warning("Unable to find PDC emulator via DNS.")
-                return {'pdc': None, 'timestamp': '0', 'clockskew': 0}
+            with LPCTX_WRAPPER() as lp:
+                ctx = lp.get_ctx()
+                pdc = ActiveDirectory_Conn(conf=ad, logger=self.logger, lpctx=ctx).get_pdc()
+                if not pdc:
+                    self.logger.warning("Unable to find PDC emulator via DNS.")
+                    return {'pdc': None, 'timestamp': '0', 'clockskew': 0}
+
         except CallError:
             AD_DNS = ActiveDirectory_DNS(conf=ad, logger=self.logger)
             res = AD_DNS.get_n_working_servers(SRV['DOMAINCONTROLLER'], 1)
@@ -892,7 +893,9 @@ class ActiveDirectoryService(ConfigService):
                 dc = res[0]['host']
 
         try:
-            ret = ActiveDirectory_Conn(conf=data, logger=self.logger).conn_check(dc)
+            with LPCTX_WRAPPER() as l:
+                ctx = l.get_ctx
+                ret = ActiveDirectory_Conn(conf=data, logger=self.logger, lpctx=ctx).conn_check(dc)
         except NTSTATUSError as e:
             if e.args[0] == ntstatus.NT_STATUS_NO_TRUST_SAM_ACCOUNT:
                 raise CallError("No SAM Trust Account for this TrueNAS server exists "
@@ -1161,7 +1164,9 @@ class ActiveDirectoryService(ConfigService):
         ad = self.middleware.call_sync('activedirectory.config')
         smb = self.middleware.call_sync('smb.config')
 
-        domain = ActiveDirectory_Conn(conf=ad, logger=self.logger).get_domain()
+        with LPCTX_WRAPPER() as lp:
+            ctx = lp.get_ctx()
+            domain = ActiveDirectory_Conn(conf=ad, logger=self.logger, lpctx=ctx).get_domain()
 
         if domain and smb['workgroup'] != ret:
             self.logger.debug(f'Updating SMB workgroup to match the short form of the AD domain [{ret}]')
