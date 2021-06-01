@@ -31,7 +31,6 @@ class IDType(enum.Enum):
     GROUP = "GROUP"
     BOTH = "BOTH"
 
-
 class IdmapBackend(enum.Enum):
     AD = {
         'description': 'The AD backend provides a way for TrueNAS to read id '
