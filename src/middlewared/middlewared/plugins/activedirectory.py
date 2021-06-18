@@ -16,7 +16,7 @@ import time
 from dns import resolver
 from middlewared.plugins.smb import SMBCmd, SMBPath, WBCErr
 from middlewared.schema import accepts, Bool, Dict, Int, List, Str
-from middlewared.service import job, private, ConfigService, Service, ValidationError, ValidationErrors
+from middlewared.service import job, private, TDBWrapConfigService, Service, ValidationError, ValidationErrors
 from middlewared.service_exception import CallError
 import middlewared.sqlalchemy as sa
 from middlewared.utils import run
@@ -33,6 +33,26 @@ from samba import (ntstatus, NTSTATUSError)
 
 LP_CTX = param.get_context()
 FEATURE_SEAL = 4
+
+AD_SMBCONF_PARAMS = {
+    "server role": "member server",
+    "kerberos method": "secrets and keytab",
+    "security": "ADS",
+    "local master": False,
+    "domain master": False,
+    "preferred master": False,
+    "winbind cache time": 7200,
+    "winbind max domain connections": 10,
+    "client ldap sasl wrapping": "seal",
+    "template shell": "/bin/sh",
+    "ads dns update": None,
+    "realm": None,
+    "allow trusted domains": None,
+    "winbind enum users": None,
+    "winbind enum groups": None,
+    "winbind use default domain": None,
+    "winbind nss info": None,
+}
 
 
 class neterr(enum.Enum):
@@ -268,13 +288,64 @@ class ActiveDirectoryModel(sa.Model):
     ad_createcomputer = sa.Column(sa.String(255))
 
 
-class ActiveDirectoryService(ConfigService):
+class ActiveDirectoryService(TDBWrapConfigService):
+    tdb_defaults = {
+        "id": 1,
+        "domainname": "",
+        "bindname": "",
+        "bindpw": "",
+        "verbose_logging": False,
+        "allow_trusted_doms": False,
+        "use_default_domain": False,
+        "allow_dns_updates": True,
+        "kerberos_principal": "",
+        "kerberos_realm": None,
+        "createcomputer": "",
+        "site": "",
+        "timeout": 60,
+        "dns_timeout": 10,
+        "nss_info": None,
+        "disable_freenas_cache": False,
+        "restrict_pam": False,
+        "enable": False,
+    }
+
     class Config:
         service = "activedirectory"
         datastore = 'directoryservice.activedirectory'
         datastore_extend = "activedirectory.ad_extend"
         datastore_prefix = "ad_"
         cli_namespace = "directory_service.activedirectory"
+
+    @private
+    async def convert_schema_to_registry(self, data_in, data_out):
+        """
+        Convert middleware schema SMB shares to an SMB service definition
+        """
+        params = AD_SMBCONF_PARAMS.copy()
+
+        if not data_in['enable']:
+            return
+
+        for k, v in params.items():
+            if k is None:
+                continue
+
+            data_out[k] = {"parsed": v}
+
+        data_out.update({
+            "ads dns update": data_in["ads_ds_updates"],
+            "realm": data_in["domainname"].upper(),
+            "allow trusted domains": data_in["allow_trusted_domains"],
+            "winbind enum users": not data_in["disable_freenas_cache"],
+            "winbind enum groups": not data_in["disable_freenas_cache"],
+            "winbind use default domain": data_in["use_default_domain"],
+        })
+
+        if data_in.get("nss_info"):
+            data_out["winbind nss info"] = data_in["nss_info"]
+
+        return
 
     @private
     async def ad_extend(self, ad):
@@ -507,6 +578,7 @@ class ActiveDirectoryService(ConfigService):
         machine account is generated. It is used for all future
         LDAP / AD interaction and the user-provided credentials are removed.
         """
+        await self.middleware.call("smb.cluster_check")
         verrors = ValidationErrors()
         old = await self.config()
         new = old.copy()
@@ -553,13 +625,10 @@ class ActiveDirectoryService(ConfigService):
                 )
 
         new = await self.ad_compress(new)
-        await self.middleware.call(
-            'datastore.update',
-            'directoryservice.activedirectory',
-            old['id'],
-            new,
-            {'prefix': 'ad_'}
-        )
+        await super().do_update(new)
+
+        diff = await self.diff_conf_and_registry(new)
+        await self.middleware.call('smb.reg_apply_conf_diff', diff)
 
         start = False
         stop = False
@@ -582,6 +651,30 @@ class ActiveDirectoryService(ConfigService):
         ret = await self.config()
         ret.update({'job_id': job})
         return ret
+
+    @private
+    async def diff_conf_and_registry(self, data):
+        to_check = {}
+        smbconf = (await self.middleware.call('smb.reg_globals'))['ds']
+        await self.convert_schema_to_registry(data, to_check)
+
+        r = smbconf
+        s_keys = set(to_check.keys())
+        r_keys = set(r.keys())
+        intersect = s_keys.intersection(r_keys)
+        return {
+            'added': {x: to_check[x] for x in s_keys - r_keys},
+            'removed': {x: r[x] for x in r_keys - s_keys},
+            'modified': {x: (to_check[x], r[x]) for x in intersect if to_check[x] != r[x]},
+        }
+
+    @private
+    async def synchronize(self, data=None):
+        if data is None:
+            data = await self.config()
+
+        diff = await self.diff_conf_and_registry(data)
+        await self.middleware.call('smb.reg_apply_conf_diff', diff)
 
     @private
     async def set_state(self, state):
@@ -615,6 +708,7 @@ class ActiveDirectoryService(ConfigService):
         Start AD service. In 'UNIFIED' HA configuration, only start AD service
         on active storage controller.
         """
+        await self.middleware.call("smb.cluster_check")
         ad = await self.config()
         smb = await self.middleware.call('smb.config')
         smb_ha_mode = await self.middleware.call('smb.reset_smb_ha_mode')
@@ -630,7 +724,8 @@ class ActiveDirectoryService(ConfigService):
         job.set_progress(0, 'Preparing to join Active Directory')
         if ad['verbose_logging']:
             self.logger.debug('Starting Active Directory service for [%s]', ad['domainname'])
-        await self.middleware.call('datastore.update', self._config.datastore, ad['id'], {'ad_enable': True})
+        await super().do_update({'enable': True})
+        await self.synchronize()
         await self.middleware.call('etc.generate', 'hostname')
 
         """
@@ -644,13 +739,10 @@ class ActiveDirectoryService(ConfigService):
             if realms:
                 realm_id = realms[0]['id']
             else:
-                realm_id = await self.middleware.call('datastore.insert',
-                                                      'directoryservice.kerberosrealm',
-                                                      {'krb_realm': ad['domainname'].upper()})
+                realm_id = await self.middleware.call('kerberos.realm.create',
+                                                      {'realm': ad['domainname'].upper()})
 
-            await self.middleware.call('datastore.update',
-                                       self._config.datastore,
-                                       ad['id'], {'ad_kerberos_realm': realm_id})
+            super().do_update({"kerberos_realm": realm_id})
             ad = await self.config()
 
         if not await self.middleware.call('kerberos._klist_test'):
@@ -708,12 +800,10 @@ class ActiveDirectoryService(ConfigService):
                 kt_id = await self.middleware.call('kerberos.keytab.store_samba_keytab')
                 if kt_id:
                     self.logger.debug('Successfully generated keytab for computer account. Clearing bind credentials')
-                    await self.middleware.call(
-                        'datastore.update',
-                        'directoryservice.activedirectory',
-                        ad['id'],
-                        {'ad_bindpw': '', 'ad_kerberos_principal': f'{ad["netbiosname"].upper()}$@{ad["domainname"]}'}
-                    )
+                    super().do_update({
+                        'bindpw': '',
+                        'kerberos_principal': f'{ad["netbiosname"].upper()}$@{ad["domainname"]}'
+                    })
                     ad = await self.config()
 
             ret = neterr.JOINED
@@ -724,6 +814,7 @@ class ActiveDirectoryService(ConfigService):
             await self.middleware.call('activedirectory.set_ntp_servers')
 
         job.set_progress(90, 'Restarting SMB server.')
+        await self.middleware.call('idmap.synchronize')
         await self.middleware.call('service.restart', 'cifs')
         await self.middleware.call('etc.generate', 'pam')
         await self.middleware.call('etc.generate', 'nss')
@@ -749,13 +840,14 @@ class ActiveDirectoryService(ConfigService):
 
     @private
     async def stop(self):
-        ad = await self.config()
-        await self.middleware.call('datastore.update', self._config.datastore, ad['id'], {'ad_enable': False})
+        await self.middleware.call("smb.cluster_check")
+        super().do_update({"enable": False})
         await self.set_state(DSStatus['LEAVING'])
         await self.middleware.call('admonitor.stop')
         await self.middleware.call('etc.generate', 'hostname')
         await self.middleware.call('kerberos.stop')
-        await self.middleware.call('etc.generate', 'smb')
+        await self.synchronize()
+        await self.middleware.call('idmap.synchronize')
         await self.middleware.call('service.restart', 'cifs')
         await self.middleware.call('etc.generate', 'pam')
         await self.middleware.call('etc.generate', 'nss')
@@ -917,12 +1009,7 @@ class ActiveDirectoryService(ConfigService):
         try:
             verrors.check()
         except Exception:
-            await self.middleware.call(
-                'datastore.update',
-                'directoryservice.activedirectory',
-                config['id'],
-                {'ad_enable': False}
-            )
+            super().do_update({"enable": False})
             raise CallError('Automatically disabling ActiveDirectory service due to invalid configuration.',
                             errno.EINVAL)
 
@@ -1158,7 +1245,7 @@ class ActiveDirectoryService(ConfigService):
 
         if domain and smb['workgroup'] != ret:
             self.logger.debug(f'Updating SMB workgroup to match the short form of the AD domain [{ret}]')
-            self.middleware.call_sync('datastore.update', 'services.cifs', smb['id'], {'cifs_srv_workgroup': domain})
+            self.middleware.call_sync('smb.update', {'workgroup': domain})
 
         return ret
 
@@ -1184,9 +1271,9 @@ class ActiveDirectoryService(ConfigService):
                 return None
 
         return {
-            'krb_kdc': ' '.join(kdc),
-            'krb_admin_server': ' '.join(admin_server),
-            'krb_kpasswd_server': ' '.join(kpasswd)
+            'kdc': ' '.join(kdc),
+            'admin_server': ' '.join(admin_server),
+            'kpasswd_server': ' '.join(kpasswd)
         }
 
     @private
@@ -1196,8 +1283,7 @@ class ActiveDirectoryService(ConfigService):
         site_indexed_kerberos_servers = self.get_kerberos_servers(ad)
         if site_indexed_kerberos_servers:
             self.middleware.call_sync(
-                'datastore.update',
-                'directoryservice.kerberosrealm',
+                'kerberos.realm.update',
                 ad['kerberos_realm'],
                 site_indexed_kerberos_servers
             )
@@ -1243,12 +1329,7 @@ class ActiveDirectoryService(ConfigService):
         site = ActiveDirectory_Conn(conf=ad, logger=self.logger).get_site()
 
         if not ad['site']:
-            self.middleware.call_sync(
-                'datastore.update',
-                'directoryservice.activedirectory',
-                ad['id'],
-                {'ad_site': site}
-            )
+            super().do_update({"site": site})
 
         return site
 
@@ -1290,7 +1371,7 @@ class ActiveDirectoryService(ConfigService):
             if krb_princ:
                 await self.middleware.call('kerberos.keytab.delete', krb_princ[0]['id'])
 
-        await self.middleware.call('datastore.delete', 'directoryservice.kerberosrealm', ad['kerberos_realm'])
+        await self.middleware.call('kerberos.realm.delete', ad['kerberos_realm'])
 
         if netads.returncode == 0:
             try:

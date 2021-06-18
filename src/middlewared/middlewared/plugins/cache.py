@@ -1,13 +1,183 @@
-from middlewared.schema import Any, Str, accepts, Int
-from middlewared.service import Service, private, job
-from middlewared.utils import filter_list, osc
+from middlewared.schema import Any, Str, Dict, accepts, Int
+from middlewared.service import Service, private, job, filterable
+from middlewared.utils import filter_list, osc, run
+from middlewared.utils.tdb import TDBWrap
+from middlewared.service_exception import CallError
+
 
 from collections import namedtuple
 import time
 import pickle
+import json
 import pwd
 import grp
 import os
+
+
+class ClusterCacheService(Service):
+    tdb_path = None
+    is_clustered_fn = None
+    tdb_attach_fn = None
+    tdb_init_fn = None
+
+    class Config:
+        private = True
+
+    async def assert_ctdb_healthy(self):
+        healthy = await self.middleware.call('ctdb.general.healthy')
+        if healthy:
+            return
+
+        raise CallError("ctdb must be enabled and healthy in order "
+                        "to access clustered cache")
+
+    async def _tdb_initialize(self):
+        await self.is_clustered_fn()
+        if self.tdb_path:
+            return
+
+        self.tdb_path = await self.tdb_attach_fn()
+        return
+
+    async def _tdb_attach(self):
+        tdb_name = "middlewared.tdb"
+        cmd = ["ctdb", "attach", tdb_name, "persistent"]
+        attach = await run(cmd, check=False)
+        if attach.returncode != 0:
+            self.logger.warning("Failed to attach backend: %s",
+                                attach.stderr.decode())
+            return
+
+        dbmap = await self.middleware.call("ctdb.general.getdbmap",
+                                           [("name", "=", tdb_name)])
+
+        if not dbmap:
+            self.logger.warning("dbmap lookup failed for %s", tdb_name)
+            return
+
+        return dbmap[0]["path"]
+
+    @accepts(Str('key'))
+    async def get(self, key):
+        """
+        Get `key` from cache.
+
+        Raises:
+            KeyError: not found in the cache
+            CallError: issue with clustered key-value store
+
+        CLOCK_REALTIME because clustered
+        """
+        await self.tdb_init_fn()
+        with TDBWrap(self.tdb_path, None) as tdb:
+            tdb_value = tdb.get(key)
+
+        if tdb_value is None:
+            raise KeyError(key)
+
+        expires = float(tdb_value[:18])
+        now = time.clock_gettime(time.CLOCK_REALTIME)
+        if expires and now > expires:
+            with TDBWrap(self.tdb_path, None) as tdb:
+                tdb.remove(key)
+
+            raise KeyError(f'{key} has expired')
+
+        data = json.loads(tdb_value[18:])
+        return data
+
+    @accepts(Str('key'))
+    async def pop(self, key):
+        """
+        Removes and returns `key` from cache.
+        """
+        await self.tdb_init_fn()
+        with TDBWrap(self.tdb_path, None) as tdb:
+            tdb_value = tdb.get(key)
+            if tdb_value:
+                tdb.remove(key)
+
+        if tdb_value:
+            tdb_value = json.loads(tdb_value[18:])
+
+        return tdb_value
+
+    @accepts(Str('key'))
+    async def has_key(self, key):
+        await self.tdb_init_fn()
+        with TDBWrap(self.tdb_path, None) as tdb:
+            tdb_value = tdb.get(key)
+
+        return bool(tdb_value)
+
+    @accepts(
+        Str('key'),
+        Dict('value', additional_attrs=True),
+        Int('timeout', default=0),
+        Str('flag', enum=["CREATE", "REPLACE"], nullable=True)
+    )
+    async def put(self, key, value, timeout, flag):
+        """
+        Put `key` of `value` in the cache. `timeout` specifies time limit
+        after which it will be removed. `flag` optionally specifies insertion
+        behavior. `CREATE` flag raises KeyError if entry exists. `UPDATE` flag
+        raises KeyError if entry does not exist. When no flags are specified
+        then entry is simply inserted.
+        """
+        await self.tdb_init_fn()
+
+        if timeout != 0:
+            ts = str(time.clock_gettime(time.CLOCK_REALTIME) + timeout)
+        else:
+            ts = "0000000000.0000000"
+
+        tdb_key = key
+        tdb_val = ts + json.dumps(value)
+
+        if flag:
+            has_entry = False
+            try:
+                has_entry = bool(await self.get(tdb_key))
+            except KeyError:
+                pass
+
+            if flag == "CREATE" and has_entry:
+                raise KeyError(key)
+
+            if flag == "UPDATE" and not has_entry:
+                raise KeyError(key)
+
+        with TDBWrap(self.tdb_path, None) as tdb:
+            tdb.set(tdb_key, tdb_val)
+
+        return
+
+    @filterable
+    async def query(self, filters, options):
+        def cache_convert_cb(tdb_key, tdb_val, entries):
+            entries.append({
+                "key": tdb_key,
+                "timeout": float(tdb_val[:18]),
+                "value": json.loads(tdb_val[18:])
+            })
+            return True
+
+        if not filters:
+            filters = []
+        if not options:
+            options = {}
+
+        tdb_entries = []
+        with TDBWrap(self.tdb_path, None) as tdb:
+            tdb.traverse(cache_convert_cb, tdb_entries)
+
+        return filter_list(tdb_entries, filters, options)
+
+    def __init__(self, *args, **kwargs):
+        super(ClusterCacheService, self).__init__(*args, **kwargs)
+        self.is_clustered_fn = self.assert_ctdb_healthy
+        self.tdb_attach_fn = self._tdb_attach
+        self.tdb_init_fn = self._tdb_initialize
 
 
 class CacheService(Service):

@@ -24,11 +24,13 @@ from middlewared.schema import accepts, Any, Bool, convert_schema, Dict, Int, Li
 from middlewared.service_exception import CallException, CallError, ValidationError, ValidationErrors  # noqa
 from middlewared.settings import conf
 from middlewared.utils import filter_list, osc
+from middlewared.utils import run as async_run
 from middlewared.utils.debug import get_frame_details, get_threads_stacks
 from middlewared.logger import Logger, reconfigure_logging, stop_logging
 from middlewared.job import Job
 from middlewared.pipe import Pipes
 from middlewared.utils.type import copy_function_metadata
+from middlewared.utils.tdb import TDBWrapConfig, TDBWrapCRUD
 from middlewared.async_validators import check_path_resides_within_volume
 from middlewared.validators import Range, IpAddress
 
@@ -420,6 +422,7 @@ class ConfigServiceMetabase(ServiceBase):
             for c_name, c_bases in (
                 ('ConfigService', ('ServiceChangeMixin', 'Service')),
                 ('SystemServiceService', ('ConfigService',)),
+                ('TDBWrapConfigService', ('ConfigService',)),
             )
         ):
             return klass
@@ -495,6 +498,181 @@ class ConfigService(ServiceChangeMixin, Service, metaclass=ConfigServiceMetabase
                     return await self.middleware.call('datastore.config', datastore, options)
 
 
+class TDBWrapConfigService(ConfigService):
+    """
+    Config service with optional clustered backend
+
+    `tdb_defaults` - returned if cluster unhealthy or version mismatch
+    `tdb_attach_fn` - method used to attach tdb file backend
+    `cluster_healthy_fn` - method used to determine cluster health
+    `is_clustered_fn` - method used to determine whether server is clustered
+    `status` - result of last cluster health check
+    `last_check` - timestamp of last health check
+    `time_offset` - length of time in seconds to return last health check results
+
+    Note: CallError will be raised on update() if cluster is unhealthy,
+    version mismatch, or failure to attach tdb file.
+    """
+    service_version = {"major": 0, "minor": 1}
+    tdb_defaults = {}
+    tdb_path = None
+    tdb_attach_fn = NotImplemented
+    tdb_detach_fn = NotImplemented
+    cluster_healthy_fn = 'ctdb.general.healthy'
+    is_clustered_fn = NotImplemented
+    status = None
+    last_check = 0
+    time_offset = 30
+
+    @private
+    async def _default_tdb_attach(self):
+        tdb_name = f"{self._config.service}.tdb"
+        cmd = ["ctdb", "attach", tdb_name, "persistent"]
+        attach = await async_run(cmd, check=False)
+        if attach.returncode != 0:
+            self.logger.warning("Failed to attach backend: %s",
+                                attach.stderr.decode())
+            return
+
+        dbmap = await self.middleware.call("ctdb.general.getdbmap",
+                                           [("name", "=", tdb_name)])
+
+        if not dbmap:
+            self.logger.warning("dbmap lookup failed for %s", tdb_name)
+            return
+
+        return dbmap[0]["path"]
+
+    @private
+    async def _default_cluster_check(self):
+        ha_mode = await self.middleware.call('smb.get_smb_ha_mode')
+        return ha_mode == "CLUSTERED"
+
+    async def is_clustered(self):
+        if self.is_clustered_fn is NotImplemented:
+            return await self._default_cluster_check()
+
+        return await self.middleware.call(self.is_clustered_fn)
+
+    @private
+    async def _initialize_tdb(self):
+        if self.tdb_path:
+            return
+
+        is_clustered = await self.is_clustered()
+        if not is_clustered:
+            return
+
+        if self.tdb_attach_fn is NotImplemented:
+            self.tdb_path = await self._default_tdb_attach()
+
+        else:
+            self.tdb_path = await self.middleware.call(self.tdb_attach_fn)
+
+        if not self.tdb_path:
+            raise CallError("Failed to initialize TDB path.")
+
+    @private
+    async def cluster_healthy(self):
+        """
+        Return cached results for up to `time_offset` seconds.
+        This is to provide some backoff so that services aren't
+        constanting hitting `cluster_healthy_fn`.
+        """
+        now = time.monotonic()
+        if self.last_check + self.time_offset > now:
+            return self.status
+
+        try:
+            status = await self.middleware.call(self.cluster_healthy_fn)
+        except Exception:
+            self.logger.warning("%s: cluster health check [%s] failed.",
+                                self._config.namespace, self.cluster_healthy_fn, exc_info=True)
+            status = False
+
+        self.status = status
+        self.last_check = now
+
+        return status
+
+    @accepts()
+    async def config(self):
+        is_clustered = await self.is_clustered()
+        if not is_clustered:
+            return await super().config()
+
+        if not await self.cluster_healthy():
+            return self.tdb_defaults.copy()
+
+        if self.tdb_path is None:
+            await self._initialize_tdb()
+
+        with TDBWrapConfig(self.tdb_path, self._config.namespace) as t:
+            tdb_config = t.config()
+
+        version = tdb_config['version']
+        data = tdb_config['data']
+
+        if data is None:
+            data = self.tdb_defaults.copy()
+
+        if version and self.service_version != version:
+            self.logger.error(
+                "%s: Service version mismatch. Service update migration is required. "
+                "Returning default values.", self._config.namespace
+            )
+            data = self.tdb_defaults.copy()
+
+        if not self._config.datastore_extend:
+            return data
+
+        return await self.middleware.call(self._config.datastore_extend, data)
+
+    async def do_update(self, data):
+        is_clustered = await self.is_clustered()
+        if not is_clustered:
+            id = data.pop("id", 1)
+            await self.middleware.call(
+                'datastore.update',
+                self._config.datastore,
+                id,
+                data,
+                {"prefix": self._config.datastore_prefix}
+            )
+            return await self.config()
+
+        if not await self.cluster_healthy():
+            raise CallError("Clustered configuration may not be altered while cluster is unhealthy.")
+
+        if self.tdb_path is None:
+            await self._initialize_tdb()
+
+        with TDBWrapConfig(self.tdb_path, self._config.namespace) as t:
+            old = t.config()
+            version = old['version']
+            new = old['data']
+            if new is None:
+                new = self.tdb_defaults.copy()
+
+            new.update(data)
+            payload = {"version": self.service_version, "data": new}
+            try:
+                t.update(payload)
+            except ValueError:
+                raise CallError(
+                    f'{self._config.namespace}: service version mismatch. '
+                    f'Node: {self.service_version["major"]}.{self.service_version["minor"]}'
+                    f'cluster: {version["major"]}.{version["minor"]}'
+                )
+
+            tdb_config = t.config()
+
+        if not self._config.datastore_extend:
+            return tdb_config["data"]
+
+        return await self.middleware.call(self._config.datastore_extend, tdb_config["data"])
+
+
 class SystemServiceService(ConfigService):
     """
     Service service abstract class
@@ -536,6 +714,7 @@ class CRUDServiceMetabase(ServiceBase):
                 ('SharingTaskService', ('CRUDService',)),
                 ('SharingService', ('SharingTaskService',)),
                 ('TaskPathService', ('SharingTaskService',)),
+                ('TDBWrapCRUDService', ('CRUDService',)),
             )
         ):
             return klass
@@ -921,6 +1100,219 @@ class TaskPathService(SharingTaskService):
     @private
     async def human_identifier(self, share_task):
         return share_task[self.path_field]
+
+
+class TDBWrapCRUDService(CRUDService):
+    """
+    Config service with optional clustered backend
+
+    `tdb_attach_fn` - method used to attach tdb file backend
+    `cluster_healthy_fn` - method used to determine cluster health
+    `is_clustered_fn` - method used to determine whether server is clustered
+    `status` - result of last cluster health check
+    `last_check` - timestamp of last health check
+    `time_offset` - length of time in seconds to return last health check results
+
+    Note: CallError will be raised on update() if cluster is unhealthy,
+    version mismatch, or failure to attach tdb file.
+    """
+    service_version = {"major": 0, "minor": 1}
+    tdb_path = None
+    tdb_attach_fn = NotImplemented
+    tdb_detach_fn = NotImplemented
+    cluster_healthy_fn = 'ctdb.general.healthy'
+    is_clustered_fn = NotImplemented
+    status = None
+    last_check = 0
+    time_offset = 30
+
+    @private
+    async def _default_tdb_attach(self):
+        tdb_name = f"{self._config.service}.tdb"
+        cmd = ["ctdb", "attach", tdb_name, "persistent"]
+        attach = await async_run(cmd, check=False)
+        if attach.returncode != 0:
+            self.logger.warning("Failed to attach backend: %s",
+                                attach.stderr.decode())
+            return
+
+        dbmap = await self.middleware.call("ctdb.general.getdbmap",
+                                           [("name", "=", tdb_name)])
+
+        if not dbmap:
+            self.logger.warning("dbmap lookup failed for %s", tdb_name)
+            return
+
+        return dbmap[0]["path"]
+
+    @private
+    async def _default_cluster_check(self):
+        ha_mode = await self.middleware.call('smb.get_smb_ha_mode')
+        return ha_mode == "CLUSTERED"
+
+    async def is_clustered(self):
+        if self.is_clustered_fn is NotImplemented:
+            return await self._default_cluster_check()
+
+        return await self.middleware.call(self.is_clustered_fn)
+
+    @private
+    async def _initialize_tdb(self):
+        if self.tdb_path:
+            return
+
+        is_clustered = await self.is_clustered()
+        if not is_clustered:
+            return
+
+        if self.tdb_attach_fn is NotImplemented:
+            self.tdb_path = await self._default_tdb_attach()
+
+        else:
+            self.tdb_path = await self.middleware.call(self.tdb_attach_fn)
+
+        if not self.tdb_path:
+            raise CallError("Failed to initialize TDB path.")
+
+    @private
+    async def cluster_healthy(self):
+        """
+        Return cached results for up to `time_offset` seconds.
+        This is to provide some backoff so that services aren't
+        constanting hitting `cluster_healthy_fn`.
+        """
+        now = time.monotonic()
+        if self.last_check + self.time_offset > now:
+            return self.status
+
+        try:
+            status = await self.middleware.call(self.cluster_healthy_fn)
+        except Exception:
+            self.logger.warning("%s: cluster health check [%s] failed.",
+                                self._config.namespace, self.cluster_healthy_fn, exc_info=True)
+            status = False
+
+        self.status = status
+        self.last_check = now
+
+        return status
+
+    @filterable
+    async def query(self, filters, options):
+        is_clustered = await self.is_clustered()
+        if not is_clustered:
+            res = await self.middleware.call(
+                'datastore.query',
+                self._config.datastore,
+                filters, options
+            )
+            return res
+
+        if not await self.cluster_healthy():
+            return []
+
+        if self.tdb_path is None:
+            await self._initialize_tdb()
+
+        with TDBWrapCRUD(self.tdb_path, self._config.namespace) as t:
+            res = t.query()
+
+        version = res['version']
+        data = res['data']
+
+        if data is None:
+            return []
+
+        if version and self.service_version != version:
+            self.logger.error(
+                "%s: Service version mismatch. Service update migration is required. "
+                "Returning default values.", self._config.namespace
+            )
+            return []
+
+        if not self._config.datastore_extend:
+            return filter_list(data, filters, options)
+
+        to_filter = []
+        for entry in data:
+            extended = await self.middleware.call(self._config.datastore_extend, entry)
+            to_filter.append(entry)
+
+        return filter_list(to_filter, filters, options)
+
+    async def do_create(self, data):
+        is_clustered = await self.is_clustered()
+        if not is_clustered:
+            id = await self.middleware.call(
+                "datastore.insert",
+                self._config.datastore, data,
+                {"prefix": self._config.datastore_prefix},
+            )
+            return id
+
+        if not await self.cluster_healthy():
+            raise CallError("Clustered configuration may not be altered while cluster is unhealthy.")
+
+        if self.tdb_path is None:
+            await self._initialize_tdb()
+
+        with TDBWrapCRUD(self.tdb_path, self._config.namespace) as t:
+            payload = {"version": self.service_version, "data": data}
+            try:
+                res = t.create(payload)
+            except ValueError:
+                raise CallError(
+                    f'{self._config.namespace}: service version mismatch. '
+                    f'Node: {self.service_version["major"]}.{self.service_version["minor"]}'
+                    f'cluster: {version["major"]}.{version["minor"]}'
+                )
+
+        return res
+
+    async def do_update(self, id, data):
+        is_clustered = await self.is_clustered()
+        if not is_clustered:
+            res = await self.middleware.call(
+                "datastore.update",
+                self._config.datastore, id, data,
+                {"prefix": self._config.datastore_prefix},
+            )
+            return res
+
+        if not await self.cluster_healthy():
+            raise CallError("Clustered configuration may not be altered while cluster is unhealthy.")
+
+        if self.tdb_path is None:
+            await self._initialize_tdb()
+
+        with TDBWrapCRUD(self.tdb_path, self._config.namespace) as t:
+            payload = {"version": self.service_version, "data": data}
+            try:
+                res = t.update(id, payload)
+            except ValueError:
+                raise CallError(
+                    f'{self._config.namespace}: service version mismatch. '
+                    f'Node: {self.service_version["major"]}.{self.service_version["minor"]}'
+                    f'cluster: {version["major"]}.{version["minor"]}'
+                )
+
+        return res
+
+    async def do_delete(self, id):
+        is_clustered = await self.is_clustered()
+        if not is_clustered:
+            return await self.middleware.call("datastore.delete", self._config.datastore, id)
+
+        if not await self.cluster_healthy():
+            raise CallError("Clustered configuration may not be altered while cluster is unhealthy.")
+
+        if self.tdb_path is None:
+            await self._initialize_tdb()
+
+        with TDBWrapCRUD(self.tdb_path, self._config.namespace) as t:
+            res = t.delete(id)
+
+        return res
 
 
 def is_service_class(service, klass):
@@ -1657,4 +2049,4 @@ class CoreService(Service):
 
 
 ABSTRACT_SERVICES = (ConfigService, CRUDService, SystemServiceService, SharingTaskService, SharingService,
-                     TaskPathService)
+                     TaskPathService, TDBWrapConfigService, TDBWrapCRUDService)

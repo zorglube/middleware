@@ -12,6 +12,19 @@ from middlewared.service_exception import CallError
 from middlewared.utils import run, osc
 from samba.dcerpc.messaging import MSG_WINBIND_OFFLINE, MSG_WINBIND_ONLINE
 
+DEFAULT_AD_CONF = {
+    "id": 1,
+    "bindname": "",
+    "verbose_logging": False,
+    "kerberos_principal": "",
+    "kerberos_realm": None,
+    "createcomputer": "",
+    "disable_freenas_cache": False,
+    "restrict_pam": False
+}
+
+MIDTDB_LOCK = None
+
 
 class DSStatus(enum.Enum):
     DISABLED = enum.auto()

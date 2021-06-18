@@ -3,6 +3,7 @@ from middlewared.common.listen import SystemServiceListenMultipleDelegate
 from middlewared.schema import Bool, Dict, IPAddr, List, Str, Int, Patch
 from middlewared.service import accepts, job, private, SharingService, SystemServiceService, ValidationErrors, filterable
 from middlewared.service_exception import CallError
+from middlewared.plugins.smb_.smbconf.reg_global_smb import LOGLEVEL_MAP
 import middlewared.sqlalchemy as sa
 from middlewared.utils import osc, Popen, run
 from pathlib import Path
@@ -23,19 +24,9 @@ except ImportError:
     param = None
 
 
-LOGLEVEL_MAP = {
-    '0': 'NONE',
-    '1': 'MINIMUM',
-    '2': 'NORMAL',
-    '3': 'FULL',
-    '10': 'DEBUG',
-}
 RE_NETBIOSNAME = re.compile(r"^[a-zA-Z0-9\.\-_!@#\$%^&\(\)'\{\}~]{1,15}$")
 
 LP_CTX = param.get_context()
-
-# placeholder for proper ctdb health check
-CLUSTER_IS_HEALTHY = True
 
 
 class SMBHAMODE(enum.IntEnum):
@@ -330,25 +321,28 @@ class SMBService(SystemServiceService):
         return True
 
     @private
-    def getparm(self, parm, section):
+    async def getparm(self, parm, section):
         """
         Get a parameter from the smb4.conf file. This is more reliable than
         'testparm --parameter-name'. testparm will fail in a variety of
         conditions without returning the parameter's value.
         """
+        ret = None
         try:
-            if section.upper() == 'GLOBAL':
-                try:
-                    LP_CTX.load(SMBPath.GLOBALCONF.platform())
-                except Exception as e:
-                    self.logger.warning("Failed to reload smb.conf: %s", e)
-
-                return LP_CTX.get(parm)
-            else:
-                return self.middleware.call_sync('sharing.smb.reg_getparm', section, parm)
-
+            ret = await self.middleware.call('sharing.smb.reg_getparm', section, parm)
         except Exception as e:
-            raise CallError(f'Attempt to query smb4.conf parameter [{parm}] failed with error: {e}')
+            if not section.upper() == 'GLOBAL':
+                raise CallError(f'Attempt to query smb4.conf parameter [{parm}] failed with error: {e}')
+
+        if ret:
+            return ret
+
+        try:
+            LP_CTX.load(SMBPath.GLOBALCONF.platform())
+        except Exception as e:
+            self.logger.warning("Failed to reload smb.conf: %s", e)
+
+        return LP_CTX.get(parm)
 
     @private
     def set_passdb_backend(self, backend_type):
@@ -421,6 +415,15 @@ class SMBService(SystemServiceService):
                                 load.stderr.decode())
 
     @private
+    async def ctdb_wait(self):
+        while True:
+            healthy = await self.middleware.call('ctdb.general.healthy')
+            if healthy:
+                return
+
+            await asyncio.sleep(1)
+
+    @private
     @job(lock="smb_configure")
     async def configure(self, job, create_paths=True):
         """
@@ -429,9 +432,48 @@ class SMBService(SystemServiceService):
         do not exist or have incorrect permissions.
         """
         data = await self.config()
+        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
         job.set_progress(0, 'Setting up SMB directories.')
         if create_paths:
             await self.setup_directories()
+
+        job.set_progress(10, 'Generating stub SMB config.')
+        await self.middleware.call('etc.generate', 'smb')
+
+        """
+        smb4.conf registry setup. The smb config is split between five
+        different middleware plugins (smb, idmap, ad, ldap, sharing.smb).
+        This initializes them in the above order so that configuration errors
+        do not occur.
+        """
+        if ha_mode == SMBHAMODE.CLUSTERED:
+            """
+            Cluster should be healthy before we start synchonizing configuration.
+            """
+            job.set_progress(25, 'Waiting for ctdb to become healthy.')
+            await self.ctdb_wait()
+            job.set_progress(30, 'Generating SMB, idmap, and directory service config.')
+            await self.middleware.call('smb.initialize_globals')
+            ad_enabled = (await self.middleware.call('smb.getparm', 'security', 'global')) == 'ADS'
+            """
+            Clustered LDAP client is currently not implemented.
+            """
+            # ldap_enabled = (await self.middleware.call('directoryservices.get_conf', 'directoryservice.ldap'))['enable']
+            ldap_enabled = False
+            await self.middleware.call('idmap.ctdb_setup')
+        else:
+            job.set_progress(25, 'generating SMB, idmap, and directory service config.')
+            await self.middleware.call('smb.initialize_globals')
+            ad_enabled = (await self.middleware.call('activedirectory.config'))['enable']
+            ldap_enabled = (await self.middleware.call('ldap.config'))['enable']
+            await self.middleware.call('idmap.synchronize')
+
+        if ad_enabled:
+            await self.middleware.call('activedirectory.synchronize')
+            await self.middleware.call('idmap.synchronize')
+        elif ldap_enabled:
+            await self.middleware.call('ldap.synchronize')
+            await self.middleware.call('idmap.synchronize')
 
         job.set_progress(30, 'Setting up server SID.')
         await self.middleware.call('smb.set_sid', data['cifs_SID'])
@@ -441,8 +483,11 @@ class SMBService(SystemServiceService):
         will provide the SMB users and groups. We skip these steps to avoid having
         samba potentially try to write our local users and groups to the remote
         LDAP server.
+
+        Local users and groups are skipped on clustered servers for now.
         """
-        if await self.middleware.call("smb.getparm", "passdb backend", "global") == "tdbsam":
+        passdb_backend = await self.middleware.call('smb.getparm', 'passdb backend', 'global')
+        if ha_mode != SMBHAMODE.CLUSTERED and passdb_backend == "tdbsam":
             job.set_progress(40, 'Synchronizing passdb and groupmap.')
             await self.middleware.call('etc.generate', 'user')
             pdb_job = await self.middleware.call("smb.synchronize_passdb")
@@ -454,13 +499,11 @@ class SMBService(SystemServiceService):
         """
         The following steps ensure that we cleanly import our SMB shares
         into the registry.
+        This step is not required when underlying database is clustered (cluster node should
+        just recover with info from other nodes on reboot).
         """
         job.set_progress(60, 'generating SMB share configuration.')
-        await self.middleware.call('cache.put', 'SMB_REG_INITIALIZED', False)
-        await self.middleware.call("etc.generate", "smb_share")
-        await self.middleware.call("smb.import_conf_to_registry")
-        await self.middleware.call('cache.put', 'SMB_REG_INITIALIZED', True)
-        os.unlink(SMBPath.SHARECONF.platform())
+        await self.middleware.call('sharing.smb.sync_registry')
 
         """
         It is possible that system dataset was migrated or an upgrade
@@ -481,17 +524,32 @@ class SMBService(SystemServiceService):
         if await self.middleware.call('cache.has_key', 'SMB_HA_MODE'):
             return await self.middleware.call('cache.get', 'SMB_HA_MODE')
 
-        if await self.middleware.call('failover.licensed'):
+        gl_enabled = (await self.middleware.call('service.query', [('service', '=', 'glusterd')], {'get': True}))['enable']
+
+        if gl_enabled:
+            hamode = SMBHAMODE['CLUSTERED'].name
+        elif await self.middleware.call('failover.licensed'):
             system_dataset = await self.middleware.call('systemdataset.config')
             if system_dataset['pool'] != await self.middleware.call('boot.pool_name'):
                 hamode = SMBHAMODE['UNIFIED'].name
             else:
                 hamode = SMBHAMODE['LEGACY'].name
+
         else:
             hamode = SMBHAMODE['STANDALONE'].name
 
         await self.middleware.call('cache.put', 'SMB_HA_MODE', hamode)
         return hamode
+
+    @private
+    async def cluster_check(self):
+        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
+        if ha_mode != SMBHAMODE.CLUSTERED:
+            return
+
+        ctdb_healthy = await self.middleware.call('ctdb.general.healthy')
+        if not ctdb_healthy:
+            raise CallError("SMB-related changes are not permitted while cluster unhealthy.")
 
     @private
     async def reset_smb_ha_mode(self):
@@ -513,7 +571,7 @@ class SMBService(SystemServiceService):
 
             share_name = share['name'] if not share['home'] else 'homes'
             await self.middleware.call('sharing.smb.apply_conf_diff',
-                                       'REGISTRY', share_name, diff)
+                                       share_name, diff)
 
     @private
     async def validate_smb(self, new, verrors):
@@ -613,6 +671,14 @@ class SMBService(SystemServiceService):
             if await self.middleware.call('sharing.smb.query', [['afp', '=', True]], {'count': True}):
                 verrors.add('smb_update.aapl_extensions', 'This option must be enabled when AFP shares are present')
 
+    @private
+    async def config(self):
+        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
+        if ha_mode != SMBHAMODE.CLUSTERED:
+            return await super().config()
+
+        return await self.middleware.call('smb.reg_config')
+
     @accepts(Dict(
         'smb_update',
         Str('netbiosname', max_length=15),
@@ -641,25 +707,36 @@ class SMBService(SystemServiceService):
 
         `netbiosname` defaults to the original hostname of the system.
 
-        `workgroup` and `netbiosname` should have different values.
+        `netbiosalias` a list of netbios aliases. If Server is joined to an AD domain, additional Kerberos
+        Service Principal Names will be generated for these aliases.
+
+        `workgroup` specifies the NetBIOS workgroup to which the TrueNAS server belongs. This will be automatically
+        set to the correct value during the process of joining an AD domain. `workgroup` and `netbiosname` should have different values.
 
         `enable_smb1` allows legacy SMB clients to connect to the server when enabled.
 
-        `localmaster` when set, determines if the system participates in a browser election.
+        `aapl_extensions` enables support for SMB2 protocol extensions for MacOS clients. This is not a requirement for MacOS support,
+        but is currently a requirement for time machine support.
 
-        `domain_logons` is used to provide netlogin service for older Windows clients if enabled.
+        `localmaster` when set, determines if the system participates in a browser election.
 
         `guest` attribute is specified to select the account to be used for guest access. It defaults to "nobody".
 
-        `nullpw` when enabled allows the users to authorize access without a password.
+        The group specified as the SMB `admin_group` will be automatically added as a foreign group member of S-1-5-32-544 (builtin\admins).
+        This will afford the group all privileges granted to a local admin. Any SMB group may be selected (including AD groups).
 
-        `hostlookup` when enabled, allows using hostnames rather then IP addresses in "hostsallow"/"hostsdeny" fields
-        of SMB Shares.
+        `ntlmv1_auth` enables a legacy and insecure authentication method, which may be required for legacy or poorly-implemented
+        SMB clients.
+
+        `smb_options` smb.conf parameters that are not covered by the above supported configuration options may be added as
+        an smb_option. Not all options are tested or supported, and behavior of smb_options may change between releases. Stability of
+        smb.conf options is not guaranteed.
         """
         old = await self.config()
 
         new = old.copy()
         new.update(data)
+        await self.middleware.call("smb.cluster_check")
 
         verrors = ValidationErrors()
         ad_enabled = (await self.middleware.call('activedirectory.get_state') != "DISABLED")
@@ -683,10 +760,17 @@ class SMBService(SystemServiceService):
                 new['loglevel'] = k
                 break
 
-        await self.compress(new)
+        new['netbiosalias'] = ' '.join(new['netbiosalias'])
 
-        await self._update_service(old, new)
-        await self.middleware.call("etc.generate", "smb")
+        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
+        if ha_mode != SMBHAMODE.CLUSTERED:
+            await self.middleware.call('smb.reg_update', new)
+            await self.compress(new)
+            await self._update_service(old, new)
+        else:
+            await self.middleware.call('smb.reg_update', new)
+            await self._service_change(self._config.service, 'restart')
+
         await self.reset_smb_ha_mode()
 
         """
@@ -707,7 +791,6 @@ class SMBService(SystemServiceService):
 
     @private
     async def compress(self, data):
-        data['netbiosalias'] = ' '.join(data['netbiosalias'])
         data.pop('netbiosname_local', None)
         data.pop('next_rid')
         return data
@@ -839,8 +922,7 @@ class SharingSMBService(SharingService):
         `auxsmbconf` is a string of additional smb4.conf parameters not covered by the system's API.
         """
         ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
-        if ha_mode == SMBHAMODE.CLUSTERED and CLUSTER_IS_HEALTHY is False:
-            raise CallError("SMB share changes not permitted while cluster is unhealthy")
+        await self.middleware.call("smb.cluster_check")
 
         verrors = ValidationErrors()
         path = data['path']
@@ -896,9 +978,8 @@ class SharingSMBService(SharingService):
         """
         Update SMB Share of `id`.
         """
+        await self.middleware.call("smb.cluster_check")
         ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
-        if ha_mode == SMBHAMODE.CLUSTERED and CLUSTER_IS_HEALTHY is False:
-            raise CallError("SMB share changes not permitted while cluster is unhealthy")
 
         verrors = ValidationErrors()
         path = data.get('path')
@@ -934,7 +1015,7 @@ class SharingSMBService(SharingService):
             )
             share_name = new['name'] if not new['home'] else 'homes'
             await self.middleware.call('sharing.smb.apply_conf_diff',
-                                       'REGISTRY', share_name, diff)
+                                       share_name, diff)
 
             enable_aapl = await self.check_aapl(new)
             if enable_aapl:
@@ -1005,7 +1086,7 @@ class SharingSMBService(SharingService):
                 else:
                     share_name = new['name'] if not new['home'] else 'homes'
                     await self.middleware.call('sharing.smb.apply_conf_diff',
-                                               'REGISTRY', share_name, diff)
+                                               share_name, diff)
 
         elif old_is_locked and not new_is_locked:
             """
@@ -1034,10 +1115,8 @@ class SharingSMBService(SharingService):
         Delete SMB Share of `id`. This will forcibly disconnect SMB clients
         that are accessing the share.
         """
+        await self.middleware.call("smb.cluster_check")
         ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
-        if ha_mode == SMBHAMODE.CLUSTERED and CLUSTER_IS_HEALTHY is False:
-            raise CallError("SMB share changes not permitted while cluster is unhealthy")
-
         if ha_mode != SMBHAMODE.CLUSTERED:
             share = await self._get_instance(id)
             result = await self.middleware.call('datastore.delete', self._config.datastore, id)
@@ -1077,7 +1156,7 @@ class SharingSMBService(SharingService):
 
         if ha_mode == SMBHAMODE.CLUSTERED:
             result = await self.middleware.call(
-                'sharing.smb.registry_query', filters, options
+                'sharing.smb.reg_query', filters, options
             )
         else:
             return await super().query(filters, options)
@@ -1144,7 +1223,11 @@ class SharingSMBService(SharingService):
             'state directory',
             'private directory',
             'private dir',
+            'log level',
             'cache directory',
+            'clustering',
+            'ctdb socket',
+            'socket options',
         ]
         for entry in data.splitlines():
             if entry == '' or entry.startswith(('#', ';')):
@@ -1159,6 +1242,10 @@ class SharingSMBService(SharingService):
                 continue
 
             if kv[0].strip() in aux_blacklist:
+                """
+                This one checks our ever-expanding enumeration of badness.
+                Parameters are blacklisted if incorrect values can prevent smbd from starting.
+                """
                 verrors.add(
                     f'{schema_name}.auxsmbconf',
                     f'{kv[0]} is a blacklisted auxiliary parameter. Changes to this parameter '
@@ -1183,6 +1270,28 @@ class SharingSMBService(SharingService):
         verrors.check()
 
     @private
+    async def cluster_share_validate(self, data, schema_name, verrors):
+        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
+        if ha_mode != SMBHAMODE.CLUSTERED:
+            return
+
+        if data['shadowcopy']:
+            verrors.add(
+                f'{schema_name}.shadowcopy',
+                'Shadow Copies are not implemented for clustered shares.'
+            )
+        if data['fsrvp']:
+            verrors.add(
+                f'{schema_name}.fsrvp',
+                'FSRVP support is not implemented for clustered shares.'
+            )
+        if not data['cluster_volname']:
+            verrors.add(
+                f'{schema_name}.cluster_volname',
+                'Cluster volume name is required for clustered shares.'
+            )
+
+    @private
     async def validate(self, data, schema_name, verrors, old=None):
         """
         Path is a required key in almost all cases. There is a special edge case for LDAP
@@ -1198,6 +1307,8 @@ class SharingSMBService(SharingService):
                         'Only one share is allowed to be a home share.')
 
         bypass = bool(data['cluster_volname'])
+
+        await self.cluster_share_validate(data, schema_name, verrors)
 
         if data['path']:
             await self.validate_path_field(data, schema_name, verrors, bypass=bypass)

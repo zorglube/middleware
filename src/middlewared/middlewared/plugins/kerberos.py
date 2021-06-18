@@ -10,7 +10,7 @@ import contextlib
 import time
 from middlewared.plugins.idmap import DSType
 from middlewared.schema import accepts, Dict, Int, List, Patch, Str
-from middlewared.service import CallError, ConfigService, CRUDService, job, periodic, private, ValidationErrors
+from middlewared.service import CallError, TDBWrapConfigService, TDBWrapCRUDService, CRUDService, job, periodic, private, ValidationErrors
 import middlewared.sqlalchemy as sa
 from middlewared.utils import run, Popen
 import middlewared.utils.osc as osc
@@ -105,7 +105,13 @@ class KerberosModel(sa.Model):
     ks_libdefaults_aux = sa.Column(sa.Text())
 
 
-class KerberosService(ConfigService):
+class KerberosService(TDBWrapConfigService):
+    tdb_defaults = {
+        "id": 1,
+        "appdefaults_aux": "",
+        "libdefaults_aux": ""
+    }
+
     class Config:
         service = "kerberos"
         datastore = 'directoryservice.kerberossettings'
@@ -137,16 +143,9 @@ class KerberosService(ConfigService):
             'kerberos_settings_update',
             await self._validate_libdefaults(new['libdefaults_aux'])
         )
-        if verrors:
-            raise verrors
+        verrors.check()
 
-        await self.middleware.call(
-            'datastore.update',
-            self._config.datastore,
-            old['id'],
-            new,
-            {'prefix': 'ks_'}
-        )
+        await super().do_update(data)
 
         await self.middleware.call('etc.generate', 'kerberos')
         return await self.config()
@@ -291,16 +290,16 @@ class KerberosService(ConfigService):
             return True
 
         if dstype == DSType.DS_TYPE_ACTIVEDIRECTORY:
-                principal = f'{data["bindname"]}@{data["domainname"].upper()}'
+            principal = f'{data["bindname"]}@{data["domainname"].upper()}'
 
         elif dstype == DSType.DS_TYPE_LDAP:
-                krb_realm = await self.middleware.call(
-                    'kerberos.realm.query',
-                    [('id', '=', data['kerberos_realm'])],
-                    {'get': True}
-                )
-                bind_cn = (data['binddn'].split(','))[0].split("=")
-                principal = f'{bind_cn[1]}@{krb_realm["realm"]}'
+            krb_realm = await self.middleware.call(
+                'kerberos.realm.query',
+                [('id', '=', data['kerberos_realm'])],
+                {'get': True}
+            )
+            bind_cn = (data['binddn'].split(','))[0].split("=")
+            principal = f'{bind_cn[1]}@{krb_realm["realm"]}'
 
         if krb5 == KRB5.MIT:
             kinit = await Popen(
@@ -324,7 +323,6 @@ class KerberosService(ConfigService):
         """
         For now we only check for kerberos realms explicitly configured in AD and LDAP.
         """
-        data = {}
         ad = await self.middleware.call('activedirectory.config')
         ldap = await self.middleware.call('ldap.config')
         await self.middleware.call('etc.generate', 'kerberos')
@@ -375,7 +373,7 @@ class KerberosService(ConfigService):
                     server = d[2]
                     flags = None
                     etype = None
-                    next_two = [idx+1, idx+2]
+                    next_two = [idx + 1, idx + 2]
                     for i in next_two:
                         if i >= tlen:
                             break
@@ -546,7 +544,7 @@ class KerberosService(ConfigService):
                 kinit = await asyncio.wait_for(run(['kinit', '-R'], check=False), timeout=15)
                 if kinit.returncode != 0:
                     raise CallError(f'kinit -R failed with error: {kinit.stderr.decode()}')
-                self.logger.debug(f'Successfully renewed kerberos TGT')
+                self.logger.debug('Successfully renewed kerberos TGT')
                 await self.middleware.call('cache.pop', 'KRB_TGT_INFO')
             except asyncio.TimeoutError:
                 self.logger.debug('Attempt to renew kerberos TGT failed after 15 seconds.')
@@ -608,7 +606,7 @@ class KerberosRealmModel(sa.Model):
     )
 
 
-class KerberosRealmService(CRUDService):
+class KerberosRealmService(TDBWrapCRUDService):
     class Config:
         datastore = 'directoryservice.kerberosrealm'
         datastore_prefix = 'krb_'
@@ -661,15 +659,10 @@ class KerberosRealmService(CRUDService):
             raise verrors
 
         data = await self.kerberos_compress(data)
-        data["id"] = await self.middleware.call(
-            "datastore.insert", self._config.datastore, data,
-            {
-                "prefix": self._config.datastore_prefix
-            },
-        )
+        id = await super().do_create(data)
         await self.middleware.call('etc.generate', 'kerberos')
         await self.middleware.call('service.restart', 'cron')
-        return await self._get_instance(data['id'])
+        return await self._get_instance(id)
 
     @accepts(
         Int('id', required=True),
@@ -690,13 +683,7 @@ class KerberosRealmService(CRUDService):
         new.update(data)
 
         data = await self.kerberos_compress(new)
-        await self.middleware.call(
-            'datastore.update',
-            self._config.datastore,
-            id,
-            new,
-            {'prefix': self._config.datastore_prefix}
-        )
+        await super().do_update(id, new)
 
         await self.middleware.call('etc.generate', 'kerberos')
         return await self._get_instance(id)
@@ -706,7 +693,7 @@ class KerberosRealmService(CRUDService):
         """
         Delete a kerberos realm by ID.
         """
-        await self.middleware.call("datastore.delete", self._config.datastore, id)
+        await super().do_delete(id)
         await self.middleware.call('etc.generate', 'kerberos')
 
     @private
@@ -715,7 +702,7 @@ class KerberosRealmService(CRUDService):
         realms = await self.query()
         for realm in realms:
             if realm['realm'].upper() == data['realm'].upper():
-                verrors.add(f'kerberos_realm', f'kerberos realm with name {realm["realm"]} already exists.')
+                verrors.add('kerberos_realm', f'kerberos realm with name {realm["realm"]} already exists.')
         return verrors
 
 
@@ -727,7 +714,7 @@ class KerberosKeytabModel(sa.Model):
     keytab_name = sa.Column(sa.String(120), unique=True)
 
 
-class KerberosKeytabService(CRUDService):
+class KerberosKeytabService(TDBWrapCRUDService):
     class Config:
         datastore = 'directoryservice.kerberoskeytab'
         datastore_prefix = 'keytab_'
@@ -757,15 +744,10 @@ class KerberosKeytabService(CRUDService):
         if verrors:
             raise verrors
 
-        data["id"] = await self.middleware.call(
-            "datastore.insert", self._config.datastore, data,
-            {
-                "prefix": self._config.datastore_prefix
-            },
-        )
+        id = super().do_create(data)
         await self.middleware.call('etc.generate', 'kerberos')
 
-        return await self._get_instance(data['id'])
+        return await self._get_instance(id)
 
     @accepts(
         Int('id', required=True),
@@ -791,13 +773,7 @@ class KerberosKeytabService(CRUDService):
         if verrors:
             raise verrors
 
-        await self.middleware.call(
-            'datastore.update',
-            self._config.datastore,
-            id,
-            new,
-            {'prefix': self._config.datastore_prefix}
-        )
+        await super().do_update(id, new)
         await self.middleware.call('etc.generate', 'kerberos')
 
         return await self._get_instance(id)
@@ -808,7 +784,7 @@ class KerberosKeytabService(CRUDService):
         Delete kerberos keytab by id, and force regeneration of
         system keytab.
         """
-        await self.middleware.call("datastore.delete", self._config.datastore, id)
+        await super().do_delete(id)
         if os.path.exists(keytab['SYSTEM'].value):
             os.remove(keytab['SYSTEM'].value)
         await self.middleware.call('etc.generate', 'kerberos')
@@ -851,21 +827,9 @@ class KerberosKeytabService(CRUDService):
         ad = await self.middleware.call('activedirectory.config')
         ldap = await self.middleware.call('ldap.config')
         if ad['kerberos_principal'] and ad['kerberos_principal'] not in principal_choices:
-            await self.middleware.call(
-                'datastore.update',
-                'directoryservice.activedirectory',
-                ad['id'],
-                {'kerberos_principal': ''},
-                {'prefix': 'ad_'}
-            )
+            await self.middleware.call('activedirectory.update', {'kerberos_principal': ''})
         if ldap['kerberos_principal'] and ldap['kerberos_principal'] not in principal_choices:
-            await self.middleware.call(
-                'datastore.update',
-                'directoryservice.ldap',
-                ldap['id'],
-                {'kerberos_principal': ''},
-                {'prefix': 'ldap_'}
-            )
+            await self.middleware.call('ldap.update', {'kerberos_principal': ''})
 
     @private
     async def do_ktutil_list(self, data):
@@ -1120,14 +1084,13 @@ class KerberosKeytabService(CRUDService):
         entry = await self.query([('name', '=', 'AD_MACHINE_ACCOUNT')])
         if not entry:
             await self.middleware.call(
-                'datastore.insert',
-                'directoryservice.kerberoskeytab',
-                {'keytab_name': 'AD_MACHINE_ACCOUNT', 'keytab_file': keytab_file}
+                'kerberos.keytab.create',
+                {'name': 'AD_MACHINE_ACCOUNT', 'file': keytab_file}
             )
         else:
             id = entry[0]['id']
             updated_entry = {'keytab_name': 'AD_MACHINE_ACCOUNT', 'keytab_file': keytab_file}
-            await self.middleware.call('datastore.update', 'directoryservice.kerberoskeytab', id, updated_entry)
+            await self.middleware.call('kerberos.keytab.update', id, updated_entry)
 
         sambakt = await self.query([('name', '=', 'AD_MACHINE_ACCOUNT')])
         if sambakt:
