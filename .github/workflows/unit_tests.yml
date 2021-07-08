@@ -1,0 +1,42 @@
+name: middleware-unit-tests
+
+on:
+  # test only
+  push:
+    branches: mw_unit_tests
+
+  #  pull_request:
+  #  types:
+  #    - 'opened'
+  #    - 'synchronize'
+
+jobs:
+  mw-unit-tests:
+    runs-on: ubuntu-latest
+    env:
+      mw_path: /usr/lib/python3/dist-packages/middlewared
+
+    steps:
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v2
+      with:
+        python-version: 3.9
+
+    - name: Setup pytest
+      run: |
+        apt update
+        apt install -y python3.pip
+        pip3 install pytest
+
+    - name: Checkout middleware & copy tests
+      uses: actions/checkout@v2
+      run: |
+        cd ${{ github.repository }}/src/middlewared/middlewared
+        tar cfp - ./pytest | (cd $mw_path ; tar xfp -)
+
+    - name: Finalize dependencies
+      run: |
+        cd $mw_path/pytest
+        pip install -r unit/requirements.txt
+        pip install asynctest
+
