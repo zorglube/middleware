@@ -92,7 +92,7 @@ class ClusterCacheService(Service):
         await self.tdb_init_fn()
         tdb_value = self.tdb_handle.get(key)
         if tdb_value:
-            tdb.remove(key)
+            self.remove(key)
             tdb_value = json.loads(tdb_value[18:])
 
         return tdb_value

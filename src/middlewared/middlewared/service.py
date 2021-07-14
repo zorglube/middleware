@@ -1236,7 +1236,7 @@ class TDBWrapCRUDService(CRUDService):
         to_filter = []
         for entry in data:
             extended = await self.middleware.call(self._config.datastore_extend, entry)
-            to_filter.append(entry)
+            to_filter.append(extended)
 
         return filter_list(to_filter, filters, options)
 
@@ -1264,7 +1264,6 @@ class TDBWrapCRUDService(CRUDService):
             raise CallError(
                 f'{self._config.namespace}: service version mismatch. '
                 f'Node: {self.service_version["major"]}.{self.service_version["minor"]}'
-                f'cluster: {version["major"]}.{version["minor"]}'
             )
 
         return res
@@ -1293,7 +1292,6 @@ class TDBWrapCRUDService(CRUDService):
             raise CallError(
                 f'{self._config.namespace}: service version mismatch. '
                 f'Node: {self.service_version["major"]}.{self.service_version["minor"]}'
-                f'cluster: {version["major"]}.{version["minor"]}'
             )
 
         return res

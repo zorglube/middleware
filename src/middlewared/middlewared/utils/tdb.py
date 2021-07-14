@@ -1,4 +1,3 @@
-import tdb
 import json
 from middlewared.service_exception import MatchNotFound, CallError
 from middlewared.utils import filter_list
