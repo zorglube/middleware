@@ -541,7 +541,7 @@ class TDBWrapConfigService(ConfigService):
             self.logger.warning("dbmap lookup failed for %s", tdb_name)
             return
 
-        return dbmap[0]["path"]
+        return dbmap[0]["dbid"]
 
     @private
     async def _default_cluster_check(self):
@@ -607,8 +607,8 @@ class TDBWrapConfigService(ConfigService):
         if self.tdb_path is None:
             await self._initialize_tdb()
 
-        with TDBWrapConfig(self.tdb_path, self._config.namespace) as t:
-            tdb_config = t.config()
+        t = TDBWrapConfig(self.tdb_path, self._config.namespace)
+        tdb_config = t.config()
 
         version = tdb_config['version']
         data = tdb_config['data']
@@ -647,25 +647,25 @@ class TDBWrapConfigService(ConfigService):
         if self.tdb_path is None:
             await self._initialize_tdb()
 
-        with TDBWrapConfig(self.tdb_path, self._config.namespace) as t:
-            old = t.config()
-            version = old['version']
-            new = old['data']
-            if new is None:
-                new = self.tdb_defaults.copy()
+        t = TDBWrapConfig(self.tdb_path, self._config.namespace)
+        old = t.config()
+        version = old['version']
+        new = old['data']
+        if new is None:
+            new = self.tdb_defaults.copy()
 
-            new.update(data)
-            payload = {"version": self.service_version, "data": new}
-            try:
-                t.update(payload)
-            except ValueError:
-                raise CallError(
-                    f'{self._config.namespace}: service version mismatch. '
-                    f'Node: {self.service_version["major"]}.{self.service_version["minor"]}'
-                    f'cluster: {version["major"]}.{version["minor"]}'
-                )
+        new.update(data)
+        payload = {"version": self.service_version, "data": new}
+        try:
+            t.update(payload)
+        except ValueError:
+            raise CallError(
+                f'{self._config.namespace}: service version mismatch. '
+                f'Node: {self.service_version["major"]}.{self.service_version["minor"]}'
+                f'cluster: {version["major"]}.{version["minor"]}'
+            )
 
-            tdb_config = t.config()
+        tdb_config = t.config()
 
         if not self._config.datastore_extend:
             return tdb_config["data"]
@@ -1143,7 +1143,7 @@ class TDBWrapCRUDService(CRUDService):
             self.logger.warning("dbmap lookup failed for %s", tdb_name)
             return
 
-        return dbmap[0]["path"]
+        return dbmap[0]["dbid"]
 
     @private
     async def _default_cluster_check(self):
@@ -1214,8 +1214,8 @@ class TDBWrapCRUDService(CRUDService):
         if self.tdb_path is None:
             await self._initialize_tdb()
 
-        with TDBWrapCRUD(self.tdb_path, self._config.namespace) as t:
-            res = t.query()
+        t = TDBWrapCRUD(self.tdb_path, self._config.namespace)
+        res = t.query()
 
         version = res['version']
         data = res['data']
@@ -1256,16 +1256,16 @@ class TDBWrapCRUDService(CRUDService):
         if self.tdb_path is None:
             await self._initialize_tdb()
 
-        with TDBWrapCRUD(self.tdb_path, self._config.namespace) as t:
-            payload = {"version": self.service_version, "data": data}
-            try:
-                res = t.create(payload)
-            except ValueError:
-                raise CallError(
-                    f'{self._config.namespace}: service version mismatch. '
-                    f'Node: {self.service_version["major"]}.{self.service_version["minor"]}'
-                    f'cluster: {version["major"]}.{version["minor"]}'
-                )
+        t = TDBWrapCRUD(self.tdb_path, self._config.namespace)
+        payload = {"version": self.service_version, "data": data}
+        try:
+            res = t.create(payload)
+        except ValueError:
+            raise CallError(
+                f'{self._config.namespace}: service version mismatch. '
+                f'Node: {self.service_version["major"]}.{self.service_version["minor"]}'
+                f'cluster: {version["major"]}.{version["minor"]}'
+            )
 
         return res
 
@@ -1285,16 +1285,16 @@ class TDBWrapCRUDService(CRUDService):
         if self.tdb_path is None:
             await self._initialize_tdb()
 
-        with TDBWrapCRUD(self.tdb_path, self._config.namespace) as t:
-            payload = {"version": self.service_version, "data": data}
-            try:
-                res = t.update(id, payload)
-            except ValueError:
-                raise CallError(
-                    f'{self._config.namespace}: service version mismatch. '
-                    f'Node: {self.service_version["major"]}.{self.service_version["minor"]}'
-                    f'cluster: {version["major"]}.{version["minor"]}'
-                )
+        t = TDBWrapCRUD(self.tdb_path, self._config.namespace)
+        payload = {"version": self.service_version, "data": data}
+        try:
+            res = t.update(id, payload)
+        except ValueError:
+            raise CallError(
+                f'{self._config.namespace}: service version mismatch. '
+                f'Node: {self.service_version["major"]}.{self.service_version["minor"]}'
+                f'cluster: {version["major"]}.{version["minor"]}'
+            )
 
         return res
 
@@ -1309,8 +1309,8 @@ class TDBWrapCRUDService(CRUDService):
         if self.tdb_path is None:
             await self._initialize_tdb()
 
-        with TDBWrapCRUD(self.tdb_path, self._config.namespace) as t:
-            res = t.delete(id)
+        t = TDBWrapCRUD(self.tdb_path, self._config.namespace)
+        res = t.delete(id)
 
         return res
 

@@ -15,10 +15,10 @@ import os
 
 
 class ClusterCacheService(Service):
-    tdb_path = None
     is_clustered_fn = None
     tdb_attach_fn = None
     tdb_init_fn = None
+    tdb_handle = None
 
     class Config:
         private = True
@@ -33,10 +33,11 @@ class ClusterCacheService(Service):
 
     async def _tdb_initialize(self):
         await self.is_clustered_fn()
-        if self.tdb_path:
+        if self.tdb_handle is not None:
             return
 
-        self.tdb_path = await self.tdb_attach_fn()
+        dbid = await self.tdb_attach_fn()
+        self.tdb_handle = TDBWrap(dbid)
         return
 
     async def _tdb_attach(self):
@@ -55,7 +56,7 @@ class ClusterCacheService(Service):
             self.logger.warning("dbmap lookup failed for %s", tdb_name)
             return
 
-        return dbmap[0]["path"]
+        return dbmap[0]["dbid"]
 
     @accepts(Str('key'))
     async def get(self, key):
@@ -69,8 +70,7 @@ class ClusterCacheService(Service):
         CLOCK_REALTIME because clustered
         """
         await self.tdb_init_fn()
-        with TDBWrap(self.tdb_path, None) as tdb:
-            tdb_value = tdb.get(key)
+        tdb_value = self.tdb_handle.get(key)
 
         if tdb_value is None:
             raise KeyError(key)
@@ -78,9 +78,7 @@ class ClusterCacheService(Service):
         expires = float(tdb_value[:18])
         now = time.clock_gettime(time.CLOCK_REALTIME)
         if expires and now > expires:
-            with TDBWrap(self.tdb_path, None) as tdb:
-                tdb.remove(key)
-
+            self.tdb_handle.remove(key)
             raise KeyError(f'{key} has expired')
 
         data = json.loads(tdb_value[18:])
@@ -92,12 +90,9 @@ class ClusterCacheService(Service):
         Removes and returns `key` from cache.
         """
         await self.tdb_init_fn()
-        with TDBWrap(self.tdb_path, None) as tdb:
-            tdb_value = tdb.get(key)
-            if tdb_value:
-                tdb.remove(key)
-
+        tdb_value = self.tdb_handle.get(key)
         if tdb_value:
+            tdb.remove(key)
             tdb_value = json.loads(tdb_value[18:])
 
         return tdb_value
@@ -105,8 +100,7 @@ class ClusterCacheService(Service):
     @accepts(Str('key'))
     async def has_key(self, key):
         await self.tdb_init_fn()
-        with TDBWrap(self.tdb_path, None) as tdb:
-            tdb_value = tdb.get(key)
+        tdb_value = self.tdb_handle.get(key)
 
         return bool(tdb_value)
 
@@ -114,7 +108,7 @@ class ClusterCacheService(Service):
         Str('key'),
         Dict('value', additional_attrs=True),
         Int('timeout', default=0),
-        Str('flag', enum=["CREATE", "REPLACE"], nullable=True)
+        Str('flag', enum=["CREATE", "REPLACE"], default=None, null=True)
     )
     async def put(self, key, value, timeout, flag):
         """
@@ -147,9 +141,7 @@ class ClusterCacheService(Service):
             if flag == "UPDATE" and not has_entry:
                 raise KeyError(key)
 
-        with TDBWrap(self.tdb_path, None) as tdb:
-            tdb.set(tdb_key, tdb_val)
-
+        self.tdb_handle.set(tdb_key, tdb_val)
         return
 
     @filterable
@@ -162,14 +154,14 @@ class ClusterCacheService(Service):
             })
             return True
 
+        await self.tdb_init_fn()
         if not filters:
             filters = []
         if not options:
             options = {}
 
         tdb_entries = []
-        with TDBWrap(self.tdb_path, None) as tdb:
-            tdb.traverse(cache_convert_cb, tdb_entries)
+        self.tdb_handle.traverse(cache_convert_cb, tdb_entries)
 
         return filter_list(tdb_entries, filters, options)
 
