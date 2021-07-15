@@ -11,6 +11,46 @@ LOGLEVEL_MAP = bidict({
 
 
 class GlobalSchema(RegistrySchema):
+    def convert_registry_to_schema(self, data_in, data_out):
+        """
+        This converts existing smb.conf shares into schema used
+        by middleware. It is only used in clustered configuration.
+        """
+        to_remove = [
+            'dns proxy',
+            'bind interfaces only',
+            'disable spoolss',
+            'load printers',
+            'printcap name',
+            'enable web service discovery',
+            'unix extensions',
+        ]
+        to_check = {
+            'restrict anonymous': 2,
+            'dos filemode': True,
+            'max log size': 5120,
+        }
+        super().convert_registry_to_schema(data_in, data_out)
+
+        # remove items that should never appear in auxiliary parameters
+        for i in to_remove:
+            data_in.pop(i, None)
+
+        # remove our defaults unless they've been modified by auxiliary
+        # parameters
+        for k, v in to_check.items():
+            val = data_in.get(k)
+            if val is None:
+                continue
+
+            if val['parsed'] == v:
+                data_in.pop(k)
+
+        aux_list = [f'{k} = {v["raw"]}' for k, v in data_in.items()]
+        data_out['smb_options'] = '\n'.join(aux_list)
+
+        return
+
     def smb_proto_transform(entry, conf):
         val = conf.pop(entry.smbconf, entry.default)
         if val == entry.default:
@@ -23,6 +63,7 @@ class GlobalSchema(RegistrySchema):
         return
 
     def log_level_transform(entry, conf):
+        conf.pop('logging', None)
         val = conf.pop(entry.smbconf, entry.default)
         if val == entry.default:
             return val
@@ -49,8 +90,6 @@ class GlobalSchema(RegistrySchema):
         val = conf.pop(entry.smbconf, entry.default)
         if val == entry.default:
             return val
-
-        conf.pop('bind interfaces only', None)
 
         if type(val) == dict:
             bind_ips = val['raw'].split()

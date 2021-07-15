@@ -105,7 +105,7 @@ class SMBService(Service):
     @private
     async def reg_config(self):
         """
-        This co-routine is called in smb.config() when cluster support is enabled.
+        This is called in smb.config() when cluster support is enabled.
         In a clustered configuration, we rely exclusively on the contents of the
         clustered SMB configuration in Samba's registry.
         """
@@ -113,10 +113,6 @@ class SMBService(Service):
         reg_globals = (await self.middleware.call('smb.reg_globals'))['smb']
         gs = GlobalSchema()
         gs.convert_registry_to_schema(reg_globals, ret)
-        reg_globals.pop('logging', "file")
-        reg_globals.pop('bind interfaces only', None)
-        aux_list = [f'{k} = {v["raw"]}' for k, v in reg_globals.items()]
-        ret['smb_options'] = '\n'.join(aux_list)
         return ret
 
     @private

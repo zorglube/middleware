@@ -32,7 +32,6 @@ class ShareSchema(RegistrySchema):
 
             data_aux[k] = v['raw']
 
-        self.middleware.logger.debug("XXX: data_in: %s, data_out: %s", data_in, data_out)
         if data_aux and data_out['purpose'] not in ['NO_SHARE', 'DEFAULT_SHARE']:
             preset = self.middleware.call_sync('sharing.smb.presets')
             purpose = preset[data_out['purpose']]
