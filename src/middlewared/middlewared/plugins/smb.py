@@ -1280,6 +1280,11 @@ class SharingSMBService(SharingService):
                 f'{schema_name}.shadowcopy',
                 'Shadow Copies are not implemented for clustered shares.'
             )
+        if data['home']:
+            verrors.add(
+                f'{schema_name}.home',
+                'Home shares are not implemented for clustered shares.'
+            )
         if data['fsrvp']:
             verrors.add(
                 f'{schema_name}.fsrvp',

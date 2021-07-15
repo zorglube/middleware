@@ -74,7 +74,7 @@ class SharingSMBService(Service):
                 self.logger.debug('netconf failure for command [%s]: %s',
                                   cmd, netconf.stderr.decode())
             raise CallError(
-                f'net conf {action} [{share}] failed with error: {netconf.stderr.decode()}'
+                f'net conf {action} [{cmd}] failed with error: {netconf.stderr.decode()}'
             )
 
         if jsoncmd:

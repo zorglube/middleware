@@ -61,7 +61,7 @@ class ShareSchema(RegistrySchema):
                 for obj in vfs_objects.copy():
                     if obj in cluster_safe_objects:
                         continue
-                    vfs_objects.remote(obj)
+                    vfs_objects.remove(obj)
 
             if 'fruit' in vfs_objects:
                 if 'streams_xattr' not in vfs_objects:
@@ -142,13 +142,13 @@ class ShareSchema(RegistrySchema):
             """
             return path
 
-        path_suffix = conf.get("tn:path_suffix", {"parsed": ""})
+        path_suffix = conf.get("tn:path_suffix", {"raw": ""})
 
         """
         remove any path suffix from path before returning.
         """
-        suffix_len = len(path_suffix['raw'].split('/'))
-        if (suffix_len):
+        if path_suffix['raw']:
+            suffix_len = len(path_suffix['raw'].split('/'))
             path = path.rsplit('/', suffix_len)[0]
 
         return path
@@ -239,6 +239,13 @@ class ShareSchema(RegistrySchema):
         data_out['vfs objects']['parsed'].append("shadow_copy_zfs")
         return
 
+    def tmquot_get(entry, conf):
+        val = conf.pop(entry.smbconf, entry.default)
+        if type(val) != dict:
+            return 0
+
+        return int(val['raw'])
+
     def acl_get(entry, conf):
         conf.pop("nfs4:chown", None)
         val = conf.pop(entry.smbconf, entry.default)
@@ -328,10 +335,10 @@ class ShareSchema(RegistrySchema):
             return val
 
         if not val['parsed']:
-            return False
+            return ''
 
         conf.pop("glusterfs:logfile", "")
-        return True
+        return val['parsed']
 
     def cluster_set(entry, val, data_in, data_out):
         """
@@ -416,7 +423,8 @@ class ShareSchema(RegistrySchema):
         RegObj("ro", "read only", True),
         RegObj("browsable", "browseable", True),
         RegObj("timemachine", "fruit:time machine", True),
-        RegObj("timemachine_quota", "fruit:time machine max size", ""),
+        RegObj("timemachine_quota", "fruit:time machine max size", "",
+               smbconf_parser=tmquot_get),
         RegObj("durable handle", "posix locking", True,
                smbconf_parser=durable_get, schema_parser=durable_set),
         RegObj("recyclebin", None, False,
