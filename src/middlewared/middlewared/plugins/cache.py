@@ -75,13 +75,17 @@ class ClusterCacheService(Service):
         if tdb_value is None:
             raise KeyError(key)
 
-        expires = float(tdb_value[:16])
+        expires = float(tdb_value[:12])
         now = time.clock_gettime(time.CLOCK_REALTIME)
         if expires and now > expires:
             self.tdb_handle.remove(key)
             raise KeyError(f'{key} has expired')
 
-        data = json.loads(tdb_value[16:])
+        is_encrypted = bool(int(tdb_value[14]))
+        if is_encrypted:
+            raise NotImplementedError
+
+        data = json.loads(tdb_value[18:])
         return data
 
     @accepts(Str('key'))
@@ -91,9 +95,12 @@ class ClusterCacheService(Service):
         """
         await self.tdb_init_fn()
         tdb_value = self.tdb_handle.get(key)
+        is_encrypted = False
+
         if tdb_value:
             self.tdb_handle.remove(key)
-            tdb_value = json.loads(tdb_value[16:])
+            is_encrypted = bool(int(tdb_value[14]))
+            tdb_value = json.loads(tdb_value[18:])
 
         return tdb_value
 
@@ -132,15 +139,17 @@ class ClusterCacheService(Service):
             raise NotImplementedError
 
         await self.tdb_init_fn()
-        elapses = float(0)
 
         if timeout != 0:
-            elapses = time.clock_gettime(time.CLOCK_REALTIME) + timeout
-
-        ts = f'{elapses:.2f}'
+            ts = f'{time.clock_gettime(time.CLOCK_REALTIME) + timeout:.2f}'
+        else:
+            ts = '0000000000.00'
 
         tdb_key = key
-        tdb_val = f'{ts}:{int(options["private"])}:{json.dumps(value)}'
+
+        # This format must not be changed without careful consideration
+        # Zeros are left as padding in middle to expand boolean options if needed
+        tdb_val = f'{ts}{int(options["private"])}0000{json.dumps(value)}'
 
         if options['flag']:
             has_entry = False
@@ -163,8 +172,9 @@ class ClusterCacheService(Service):
         def cache_convert_cb(tdb_key, tdb_val, entries):
             entries.append({
                 "key": tdb_key,
-                "timeout": float(tdb_val[:16]),
-                "value": json.loads(tdb_val[16:])
+                "timeout": float(tdb_val[:12]),
+                "private": bool(int(tdb_val[14])),
+                "value": json.loads(tdb_val[18:])
             })
             return True
 
