@@ -186,7 +186,9 @@ class SharingSMBService(Service):
             gl['ad_enabled'] = (await self.middleware.call('activedirectory.config'))['enable']
 
         if gl['fruit_enabled'] is None:
-            gl['fruit_enabled'] = (await self.middleware.call('smb.config'))['aapl_extensions']
+            smbconf = await self.middleware.call('smb.config')
+            self.logger.debug("XXX: %s", smbconf)
+            gl['fruit_enabled'] = smbconf['aapl_extensions']
 
         return gl
 

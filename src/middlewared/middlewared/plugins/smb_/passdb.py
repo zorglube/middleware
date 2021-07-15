@@ -74,7 +74,7 @@ class SMBService(Service):
         ha_mode = await self.middleware.call('smb.get_smb_ha_mode')
         if ha_mode == "CLUSTERED":
             self.logger.debug("passdb support not yet implemented in clustered TrueNAS.")
-            return
+            # return
 
         if passdb_backend is None:
             passdb_backend = await self.middleware.call('smb.getparm',
@@ -107,16 +107,15 @@ class SMBService(Service):
         if not entry:
             cmd = [SMBCmd.PDBEDIT.value, '-d', '0', '-a', username]
 
-            next_rid = str(await self.middleware.call('smb.get_next_rid'))
+            next_rid = await self.middleware.call('smb.get_next_rid')
             if next_rid != -1:
-                cmd.extend(['-U', next_rid])
+                cmd.extend(['-U', str(next_rid)])
 
             cmd.append('-t')
             self.logger.debug("User [%s] does not exist in the passdb.tdb file. "
                               "Creating entry with rid [%s].", username, next_rid)
             pdbcreate = await Popen(
-                [SMBCmd.PDBEDIT.value, '-d', '0', '-a', username, '-U', next_rid, '-t'],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE
             )
             await pdbcreate.communicate(input=" \n \n".encode())
             setntpass = await run([SMBCmd.PDBEDIT.value, '-d', '0', '--set-nt-hash', smbpasswd_string[3], username], check=False)
@@ -210,7 +209,7 @@ class SMBService(Service):
             try:
                 await self.middleware.call(
                     'clustercache.put', "PASSDB_LOCK",
-                    {"node": pnn}, 300, "CREATE"
+                    {"node": pnn}, 300, {"flag": "CREATE"}
                 )
                 return
             except KeyError:

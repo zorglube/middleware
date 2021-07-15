@@ -139,7 +139,7 @@ class GlobalSchema(RegistrySchema):
                smbconf_parser=smb_proto_transform, schema_parser=set_min_protocol),
         RegObj("unixcharset", "unix charset", "UTF8"),
         RegObj("syslog", "syslog only", False),
-        RegObj("apple_extensions", "tn:fruit_enabled", False),
+        RegObj("aapl_extensions", "tn:fruit_enabled", False),
         RegObj("localmaster", "local master", False),
         RegObj("loglevel", "log level", "MINIMUM",
                smbconf_parser=log_level_transform, schema_parser=set_log_level),

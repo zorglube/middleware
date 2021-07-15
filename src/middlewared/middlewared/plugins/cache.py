@@ -1,4 +1,4 @@
-from middlewared.schema import Any, Str, Dict, accepts, Int
+from middlewared.schema import Any, Str, Dict, accepts, Int, Bool
 from middlewared.service import Service, private, job, filterable
 from middlewared.utils import filter_list, osc, run
 from middlewared.utils.tdb import TDBWrap
@@ -75,13 +75,13 @@ class ClusterCacheService(Service):
         if tdb_value is None:
             raise KeyError(key)
 
-        expires = float(tdb_value[:18])
+        expires = float(tdb_value[:16])
         now = time.clock_gettime(time.CLOCK_REALTIME)
         if expires and now > expires:
             self.tdb_handle.remove(key)
             raise KeyError(f'{key} has expired')
 
-        data = json.loads(tdb_value[18:])
+        data = json.loads(tdb_value[16:])
         return data
 
     @accepts(Str('key'))
@@ -92,8 +92,8 @@ class ClusterCacheService(Service):
         await self.tdb_init_fn()
         tdb_value = self.tdb_handle.get(key)
         if tdb_value:
-            self.remove(key)
-            tdb_value = json.loads(tdb_value[18:])
+            self.tdb_handle.remove(key)
+            tdb_value = json.loads(tdb_value[16:])
 
         return tdb_value
 
@@ -108,37 +108,51 @@ class ClusterCacheService(Service):
         Str('key'),
         Dict('value', additional_attrs=True),
         Int('timeout', default=0),
-        Str('flag', enum=["CREATE", "REPLACE"], default=None, null=True)
+        Dict('options',
+             Str('flag', enum=["CREATE", "REPLACE"], default=None, null=True),
+             Bool('private', default=False),
+        )
     )
-    async def put(self, key, value, timeout, flag):
+    async def put(self, key, value, timeout, options):
         """
         Put `key` of `value` in the cache. `timeout` specifies time limit
-        after which it will be removed. `flag` optionally specifies insertion
-        behavior. `CREATE` flag raises KeyError if entry exists. `UPDATE` flag
+        after which it will be removed.
+
+        The following options are supported:
+        `flag` optionally specifies insertion behavior.
+        `CREATE` flag raises KeyError if entry exists. `UPDATE` flag
         raises KeyError if entry does not exist. When no flags are specified
         then entry is simply inserted.
+
+        `private` determines whether data should be encrypted before being
+        committed to underlying storage backend.
         """
+        if options['private']:
+            # will implement in later commit
+            raise NotImplementedError
+
         await self.tdb_init_fn()
+        elapses = float(0)
 
         if timeout != 0:
-            ts = str(time.clock_gettime(time.CLOCK_REALTIME) + timeout)
-        else:
-            ts = "0000000000.0000000"
+            elapses = time.clock_gettime(time.CLOCK_REALTIME) + timeout
+
+        ts = f'{elapses:.2f}'
 
         tdb_key = key
-        tdb_val = ts + json.dumps(value)
+        tdb_val = f'{ts}:{int(options["private"])}:{json.dumps(value)}'
 
-        if flag:
+        if options['flag']:
             has_entry = False
             try:
                 has_entry = bool(await self.get(tdb_key))
             except KeyError:
                 pass
 
-            if flag == "CREATE" and has_entry:
+            if options['flag'] == "CREATE" and has_entry:
                 raise KeyError(key)
 
-            if flag == "UPDATE" and not has_entry:
+            if options['flag'] == "UPDATE" and not has_entry:
                 raise KeyError(key)
 
         self.tdb_handle.set(tdb_key, tdb_val)
@@ -149,8 +163,8 @@ class ClusterCacheService(Service):
         def cache_convert_cb(tdb_key, tdb_val, entries):
             entries.append({
                 "key": tdb_key,
-                "timeout": float(tdb_val[:18]),
-                "value": json.loads(tdb_val[18:])
+                "timeout": float(tdb_val[:16]),
+                "value": json.loads(tdb_val[16:])
             })
             return True
 
