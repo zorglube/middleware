@@ -117,6 +117,7 @@ class SMBService(Service):
 
     @private
     async def global_setparm(self, data):
+        self.logger.debug("XXX: %s", data)
         cmd = await run([SMBCmd.NET.value, '--json', 'conf', 'setparm', json.dumps(data)], check=False)
         if cmd.returncode != 0:
             raise CallError(f"Failed to set payload: {data}, error: "

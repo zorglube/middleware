@@ -74,9 +74,6 @@ class TDBWrap(object):
         if v is None:
             return None
 
-        with open("/tmp/service.out", "w") as f:
-            f.write(f"XXX: {v}")
-
         maj, min = v.split(".")
         return {"major": int(maj), "minor": int(min)}
 
@@ -122,6 +119,34 @@ class TDBWrapCRUD(TDBWrap):
         super().__init__(path, **kwargs)
         self.schema = schema
 
+    def _tdb_entries(self):
+        def tdb_to_list(tdb_key, tdb_val, data):
+            if tdb_key == "hwm":
+                data['hwm'] = int(tdb_val)
+                return True
+
+            if not tdb_key.startswith(data['schema']):
+                return True
+
+            entry = {"id": int(tdb_key[data["prefix_len"]:])}
+            tdb_json = json.loads(tdb_val)
+            entry.update(tdb_json)
+
+            data['entries'].append(entry)
+            data['by_id'][entry['id']] = entry
+            return True
+
+        state = {
+            "schema": self.schema,
+            "prefix_len": len(self.schema),
+            "hwm": 1,
+            "entries": [],
+            "by_id": {}
+        }
+        self.traverse(_tdb_to_list, state)
+
+        return state
+
     def query(self, filters=None, options=None):
         output = []
         if filters is None:
@@ -130,17 +155,11 @@ class TDBWrapCRUD(TDBWrap):
         if options is None:
             options = {}
 
+        self._tdb_entries()
         vers = self.service_version()
-        entries = self.get(self.schema)
-        entries = [] if entries is None else entries.split()
-        for tdb_key in entries:
-            prefix_len = len(self.schema) + 1
-            data = {"id": int(tdb_key[prefix_len:])}
-            tdb_val = self.get(tdb_key)
-            data.update(json.loads(tdb_val))
-            output.append(data)
+        state = self._tdb_entries()
 
-        res = filter_list(output, filters, options)
+        res = filter_list(state['entries'], filters, options)
         return {"version": vers, "data": res}
 
     def create(self, payload):
@@ -148,25 +167,15 @@ class TDBWrapCRUD(TDBWrap):
         data = payload['data']
 
         self.version_check(vers)
+        state = self._tdb_entries()
 
-        hwm = 0
-        entries = self.get(self.schema)
-        entries = [] if entries is None else entries.split()
+        id = state["hwm"] + 1
+        tdb_key = f'{self.schema}_{id}'
 
-        for i in entries:
-            prefix_len = len(self.schema) + 1
-            id = int(i[prefix_len:])
-            if id > hwm:
-                hwm = id
-
-        tdb_key = f'{self.schema}_{hwm + 1}'
         self.set(tdb_key, json.dumps(data))
-        entries.append(tdb_key)
-        with open("/tmp/tdb.log", "w") as f:
-            f.write(f'HMW: {hwm}, TDB_KEY: {tdb_key}, entries: {entries}')
-        self.set(self.schema, ' '.join(entries))
+        self.set("hwm", str(id))
 
-        return hwm + 1
+        return id
 
     def update(self, id, payload):
         tdb_key = f'{self.schema}_{id}'
@@ -174,31 +183,24 @@ class TDBWrapCRUD(TDBWrap):
         new = payload['data']
 
         self.version_check(vers)
+        state = self._tdb_entries()
 
-        entries = self.get(self.schema)
-        entries = [] if entries is None else entries.split()
-        if tdb_key not in entries:
+        old = state['by_id'].get(id)
+        if not old:
             raise MatchNotFound()
 
-        old = json.loads(self.get(tdb_key))
         old.update(new)
+        old.pop('id')
         tdb_val = json.dumps(old)
         self.set(tdb_key, tdb_val)
-        entries.append(tdb_key)
-        self.set(self.schema, ' '.join(entries))
-
         return
 
     def delete(self, id):
         tdb_key = f'{self.schema}_{id}'
 
-        entries = self.get(self.schema)
-        entries = [] if entries is None else entries.split()
-        if tdb_key not in entries:
+        state = self._tdb_entries()
+        if not state['by_id'].get(id):
             raise MatchNotFound()
 
         self.remove(tdb_key)
-        entries.remove(tdb_key)
-        self.set(self.schema, ' '.join(entries))
-
         return

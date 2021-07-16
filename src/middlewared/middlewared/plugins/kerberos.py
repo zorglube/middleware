@@ -664,6 +664,11 @@ class KerberosRealmService(TDBWrapCRUDService):
         await self.middleware.call('service.restart', 'cron')
         return await self._get_instance(id)
 
+    @private
+    async def simple_create(self, data):
+        id = await super().do_create(data)
+        return await self._get_instance(id)
+
     @accepts(
         Int('id', required=True),
         Patch(

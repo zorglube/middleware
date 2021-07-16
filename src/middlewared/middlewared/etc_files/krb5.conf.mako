@@ -40,7 +40,9 @@
         db_realms = []
         environment_is_kerberized = False
         db['ad'] = middleware.call_sync('activedirectory.config')
-        db['ldap'] = middleware.call_sync('datastore.query', 'directoryservice.ldap', [], {'get': True})
+        if not db['ad']['enable']:
+            dl['ldap'] = middleware.call_sync('ldap.config')
+
         db['krb_aux'] = middleware.call_sync('kerberos.config')
         db_realms = middleware.call_sync('kerberos.realm.query')
         appdefaults = {'pam': {
@@ -80,11 +82,7 @@
 
             if db_realm_entry:
                 logger.debug(f'Updating Active Directory configuration to use kerberos realm: {db_realm_entry}')
-                middleware.call_sync(
-                    'datastore.update',
-                    'directoryservice.activedirectory', '1',
-                    {'ad_kerberos_realm': db_realm_entry['id']}
-                )
+                middleware.call_sync('activedirectory.update', 'kerberos_realm': db_realm_entry['id'])
                 db_realms.append({
                     'realm': db_realm_entry['realm'],
                     'kdc': [],
@@ -93,17 +91,8 @@
                 })
             else:
                 logger.debug(f'Generating kerberos realm entry for {krb_default_realm}')
-                middleware.call_sync(
-                    'datastore.insert',
-                    'directoryservice.kerberosrealm',
-                    {'krb_realm': krb_default_realm}
-                )
-                new_realm = middleware.call_sync('kerberos.realm.query', [('realm', '=', krb_default_realm)])
-                middleware.call_sync(
-                    'datastore.update',
-                    'directoryservice.activedirectory', '1',
-                    {'ad_kerberos_realm': new_realm[0]['id']}
-                )
+                id = middleware.call_sync('kerberos.realm.simplecreate', {'realm': krb_default_realm})
+                middleware.call_sync('activedirectory.simple_update', {'kerberos_realm': id})
                 db_realms.append({
                     'realm': krb_default_realm,
                     'kdc': [],

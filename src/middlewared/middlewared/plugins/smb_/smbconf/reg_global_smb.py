@@ -74,7 +74,7 @@ class GlobalSchema(RegistrySchema):
         return LOGLEVEL_MAP.get(val['raw'].split()[0])
 
     def set_log_level(entry, val, data_in, data_out):
-        loglevelint = LOGLEVEL_MAP.inv.get(val, "MINIMUM")
+        loglevelint = LOGLEVEL_MAP.inv.get(val, 1)
         loglevel = f"{loglevelint} auth_json_audit:3@/var/log/samba4/auth_audit.log"
         if data_in['syslog']:
             logging = f'syslog@{"3" if loglevelint > 3 else val} file'

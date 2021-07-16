@@ -331,19 +331,19 @@ class ActiveDirectoryService(TDBWrapConfigService):
             if k is None:
                 continue
 
-            data_out[k] = {"parsed": v}
+            data_out[k] = {"raw": str(v), "parsed": v}
 
         data_out.update({
-            "ads dns update": data_in["ads_ds_updates"],
-            "realm": data_in["domainname"].upper(),
-            "allow trusted domains": data_in["allow_trusted_domains"],
-            "winbind enum users": not data_in["disable_freenas_cache"],
-            "winbind enum groups": not data_in["disable_freenas_cache"],
-            "winbind use default domain": data_in["use_default_domain"],
+            "ads dns update": {"parsed": data_in["allow_dns_updates"]},
+            "realm": {"parsed": data_in["domainname"].upper()},
+            "allow trusted domains": {"parsed": data_in["allow_trusted_doms"]},
+            "winbind enum users": {"parsed": not data_in["disable_freenas_cache"]},
+            "winbind enum groups": {"parsed": not data_in["disable_freenas_cache"]},
+            "winbind use default domain": {"parsed": data_in["use_default_domain"]},
         })
 
         if data_in.get("nss_info"):
-            data_out["winbind nss info"] = data_in["nss_info"]
+            data_out["winbind nss info"] = {"parsed": data_in["nss_info"]}
 
         return
 
@@ -653,6 +653,10 @@ class ActiveDirectoryService(TDBWrapConfigService):
         return ret
 
     @private
+    async def simple_update(self, data):
+        await super().do_update(data)
+
+    @private
     async def diff_conf_and_registry(self, data):
         to_check = {}
         smbconf = (await self.middleware.call('smb.reg_globals'))['ds']
@@ -665,7 +669,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
         return {
             'added': {x: to_check[x] for x in s_keys - r_keys},
             'removed': {x: r[x] for x in r_keys - s_keys},
-            'modified': {x: (to_check[x], r[x]) for x in intersect if to_check[x] != r[x]},
+            'modified': {x: to_check[x] for x in intersect if to_check[x] != r[x]},
         }
 
     @private
