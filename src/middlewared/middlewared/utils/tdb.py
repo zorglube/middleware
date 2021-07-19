@@ -4,6 +4,7 @@ from middlewared.service_exception import MatchNotFound, CallError
 from middlewared.utils import filter_list
 from subprocess import run
 
+
 class TDBWrap(object):
     def __init__(self, path, **kwargs):
         self.path = path
@@ -219,7 +220,6 @@ class TDBWrapCRUD(CTDBWrap):
         return state
 
     def query(self, filters=None, options=None):
-        output = []
         if filters is None:
             filters = []
 

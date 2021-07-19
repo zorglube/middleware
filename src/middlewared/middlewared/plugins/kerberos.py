@@ -10,7 +10,7 @@ import contextlib
 import time
 from middlewared.plugins.idmap import DSType
 from middlewared.schema import accepts, Dict, Int, List, Patch, Str
-from middlewared.service import CallError, TDBWrapConfigService, TDBWrapCRUDService, CRUDService, job, periodic, private, ValidationErrors
+from middlewared.service import CallError, TDBWrapConfigService, TDBWrapCRUDService, job, periodic, private, ValidationErrors
 import middlewared.sqlalchemy as sa
 from middlewared.utils import run, Popen
 import middlewared.utils.osc as osc

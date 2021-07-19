@@ -1,7 +1,7 @@
 from middlewared.schema import Any, Str, Dict, accepts, Int, Bool
 from middlewared.service import Service, private, job, filterable
 from middlewared.utils import filter_list, osc, run
-from middlewared.utils.tdb import TDBWrap
+from middlewared.utils.tdb import CTDBWrap
 from middlewared.service_exception import CallError
 
 
@@ -38,7 +38,7 @@ class ClusterCacheService(Service):
             return
 
         dbid = await self.tdb_attach_fn()
-        self.tdb_handle = TDBWrap(dbid)
+        self.tdb_handle = CTDBWrap(dbid)
         return
 
     async def _tdb_attach(self):
@@ -116,10 +116,7 @@ class ClusterCacheService(Service):
         Str('key'),
         Dict('value', additional_attrs=True),
         Int('timeout', default=0),
-        Dict('options',
-             Str('flag', enum=["CREATE", "REPLACE"], default=None, null=True),
-             Bool('private', default=False),
-        )
+        Dict('options', Str('flag', enum=["CREATE", "REPLACE"], default=None, null=True), Bool('private', default=False),)
     )
     async def put(self, key, value, timeout, options):
         """

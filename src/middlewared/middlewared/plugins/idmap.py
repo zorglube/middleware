@@ -4,7 +4,7 @@ import errno
 import os
 import datetime
 from middlewared.schema import accepts, Bool, Dict, Int, Patch, Str
-from middlewared.service import CallError, TDBWrapCRUDService, job, private, ValidationErrors, filterable
+from middlewared.service import CallError, TDBWrapCRUDService, job, private, ValidationErrors
 from middlewared.plugins.directoryservices import SSL
 import middlewared.sqlalchemy as sa
 from middlewared.utils import run, filter_list
@@ -653,7 +653,6 @@ class IdmapDomainService(TDBWrapCRUDService):
         `sssd_compat` generate idmap low range based on same algorithm that SSSD uses by default.
         """
         verrors = ValidationErrors()
-        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
 
         old = await self.query()
         if data['name'] in [x['name'] for x in old]:

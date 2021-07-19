@@ -10,7 +10,6 @@ from middlewared.schema import accepts
 from middlewared.service import Service, private, job
 from middlewared.plugins.smb import SMBCmd, SMBPath
 from middlewared.service_exception import CallError
-from middlewared.utils import run, osc
 from samba.dcerpc.messaging import MSG_WINBIND_OFFLINE, MSG_WINBIND_ONLINE
 
 DEFAULT_AD_CONF = {
