@@ -1,7 +1,7 @@
 from middlewared.common.attachment import LockableFSAttachmentDelegate
 from middlewared.common.listen import SystemServiceListenMultipleDelegate
 from middlewared.schema import Bool, Dict, IPAddr, List, Str, Int, Patch
-from middlewared.service import accepts, job, private, SharingService, SystemServiceService, ValidationErrors, filterable
+from middlewared.service import accepts, job, private, SharingService, TDBWrapConfigService, ValidationErrors, filterable
 from middlewared.service_exception import CallError
 from middlewared.plugins.smb_.smbconf.reg_global_smb import LOGLEVEL_MAP
 import middlewared.sqlalchemy as sa
@@ -190,7 +190,32 @@ class WBCErr(enum.Enum):
         return f'WBC_ERR_{self.name}'
 
 
-class SMBService(SystemServiceService):
+class SMBService(TDBWrapConfigService):
+
+    tdb_defaults = {
+        "id": 1,
+        "netbiosname": "truenas",
+        "netbiosname_b": "truenas-b",
+        "netbiosalias": [],
+        "workgroup": "WORKGROUP",
+        "description": "TrueNAS Server",
+        "unixcharset": "UTF-8",
+        "loglevel": "MINIMUM",
+        "syslog": False,
+        "aapl_extensions": False,
+        "localmaster": True,
+        "guest": "nobody",
+        "filemask": "",
+        "dirmask": "",
+        "smb_options": "",
+        "bindip": [],
+        "cifs_SID": "",
+        "ntlmv1_auth": False,
+        "enable_smb1": False,
+        "admin_group": None,
+        "next_rid": -1,
+        "netbiosname_local": "truenas"
+    }
 
     class Config:
         service = 'cifs'
@@ -221,7 +246,7 @@ class SMBService(SystemServiceService):
 
         smb['loglevel'] = LOGLEVEL_MAP.get(smb['loglevel'])
 
-        smb.pop('secrets')
+        smb.pop('secrets', None)
 
         return smb
 
@@ -256,8 +281,17 @@ class SMBService(SystemServiceService):
         Addresses assigned by DHCP are excluded from the results.
         """
         choices = {}
+        ha_mode = await self.get_smb_ha_mode()
+
+        if ha_mode == 'CLUSTERED':
+            for i in await self.middleware.call('ctdb.public.ips.query'):
+                choices[i['public_ip']] = i['public_ip']
+
+            return choices
+
         for i in await self.middleware.call('interface.ip_in_use'):
             choices[i['address']] = i['address']
+
         return choices
 
     @accepts()
@@ -671,14 +705,6 @@ class SMBService(SystemServiceService):
             if await self.middleware.call('sharing.smb.query', [['afp', '=', True]], {'count': True}):
                 verrors.add('smb_update.aapl_extensions', 'This option must be enabled when AFP shares are present')
 
-    @private
-    async def config(self):
-        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
-        if ha_mode != SMBHAMODE.CLUSTERED:
-            return await super().config()
-
-        return await self.middleware.call('smb.reg_config')
-
     @accepts(Dict(
         'smb_update',
         Str('netbiosname', max_length=15),
@@ -762,15 +788,9 @@ class SMBService(SystemServiceService):
 
         new['netbiosalias'] = ' '.join(new['netbiosalias'])
 
-        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
-        if ha_mode != SMBHAMODE.CLUSTERED:
-            await self.middleware.call('smb.reg_update', new)
-            await self.compress(new)
-            await self._update_service(old, new)
-        else:
-            await self.middleware.call('smb.reg_update', new)
-            await self._service_change(self._config.service, 'restart')
-
+        await super().update(new)
+        await self.middleware.call('smb.reg_update', new)
+        await self._service_change(self._config.service, 'restart')
         await self.reset_smb_ha_mode()
 
         """

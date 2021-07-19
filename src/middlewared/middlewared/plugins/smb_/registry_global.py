@@ -103,19 +103,6 @@ class SMBService(Service):
         return ret
 
     @private
-    async def reg_config(self):
-        """
-        This is called in smb.config() when cluster support is enabled.
-        In a clustered configuration, we rely exclusively on the contents of the
-        clustered SMB configuration in Samba's registry.
-        """
-        ret = {"id": 1}
-        reg_globals = (await self.middleware.call('smb.reg_globals'))['smb']
-        gs = GlobalSchema()
-        gs.convert_registry_to_schema(reg_globals, ret)
-        return ret
-
-    @private
     async def global_setparm(self, data):
         self.logger.debug("XXX: %s", data)
         cmd = await run([SMBCmd.NET.value, '--json', 'conf', 'setparm', json.dumps(data)], check=False)
@@ -139,7 +126,7 @@ class SMBService(Service):
             await self.global_setparm(set_payload)
 
         if del_payload["parameters"]:
-            await self.global_setparm(del_payload)
+            await self.global_delparm(del_payload)
 
     @private
     async def reg_update(self, data):

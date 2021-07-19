@@ -1,11 +1,97 @@
+import tdb
 import json
 from middlewared.service_exception import MatchNotFound, CallError
 from middlewared.utils import filter_list
 from subprocess import run
 
-
 class TDBWrap(object):
+    def __init__(self, path, **kwargs):
+        self.path = path
+        self.flags = kwargs.get('flags', 0)
+        self.handle = None
+        self.is_open = False
+        self.is_clustered = kwargs.get('clustered', False)
+
+    def open_tdb(self):
+        self.handle = tdb.open(self.path, self.flags)
+        self.is_open = True
+
+    def get(self, key):
+        """
+        Get value associated with string `key`.
+        If entry does not exist, then None type returned,
+        otherwise string is returned.
+        """
+        tdb_key = key.encode()
+        tdb_val = self.handle.get(tdb_key)
+        return tdb_val.decode() if tdb_val else None
+
+    def set(self, key, val):
+        tdb_key = key.encode()
+        tdb_val = val.encode()
+        self.handle.store(tdb_key, tdb_val)
+        return
+
+    def remove(self, key):
+        tdb_key = key.encode()
+        self.handle.delete(tdb_key)
+
+    def traverse(self, fn, private_data):
+        ok = True
+        for i in self.handle.keys():
+            tdb_key = i.decode()
+            tdb_val = self.get(tdb_key)
+            ok = fn(tdb_key, tdb_val, private_data)
+            if not ok:
+                break
+
+        return ok
+
+    def wipe(self):
+        if self.schema is None:
+            self.handle.clear()
+            return
+
+        for tdb_key in self.keys():
+            key = tdb_key.decode()
+            if key.startswith(self.schema):
+                self.handle.remove(tdb_key)
+
+        return
+
+    def service_version(self):
+        v = self.get("service_version")
+        if v is None:
+            return None
+
+        maj, min = v.split(".")
+        return {"major": int(maj), "minor": int(min)}
+
+    def version_check(self, new):
+        local_version = self.service_version()
+        if local_version is None:
+            self.set("service_version", f'{new["major"]}.{new["minor"]}')
+            return
+
+        if new == local_version:
+            return
+
+        raise ValueError
+
+    def __enter__(self):
+        if not self.is_clustered:
+            self.open_tdb()
+
+        return self
+
+    def __exit__(self, typ, value, traceback):
+        if self.is_open:
+            self.handle.close()
+
+
+class CTDBWrap(TDBWrap):
     def __init__(self, dbid, **kwargs):
+        super().__init__(dbid, **kwargs)
         self.dbid = dbid
 
     def get(self, key):
@@ -55,6 +141,9 @@ class TDBWrap(object):
             raise CallError(f"{self.dbid}: failed to traverse: {trv.stderr.decode()}")
 
         tdb_entries = json.loads(trv.stdout.decode())
+        with open("/tmp/traverse.out", "w") as f:
+            f.write(str(tdb_entries))
+
         for i in tdb_entries['data'][1:]:
             ok = fn(i['key'], i['val'], private_data)
             if not ok:
@@ -69,27 +158,8 @@ class TDBWrap(object):
 
         return
 
-    def service_version(self):
-        v = self.get("service_version")
-        if v is None:
-            return None
 
-        maj, min = v.split(".")
-        return {"major": int(maj), "minor": int(min)}
-
-    def version_check(self, new):
-        local_version = self.service_version()
-        if local_version is None:
-            self.set("service_version", f'{new["major"]}.{new["minor"]}')
-            return
-
-        if new == local_version:
-            return
-
-        raise ValueError
-
-
-class TDBWrapConfig(TDBWrap):
+class TDBWrapConfig(CTDBWrap):
     schema = None
 
     def __init__(self, path, schema, **kwargs):
@@ -112,7 +182,7 @@ class TDBWrapConfig(TDBWrap):
         self.set(self.schema, tdb_val)
 
 
-class TDBWrapCRUD(TDBWrap):
+class TDBWrapCRUD(CTDBWrap):
     schema = None
 
     def __init__(self, path, schema, **kwargs):
@@ -138,12 +208,13 @@ class TDBWrapCRUD(TDBWrap):
 
         state = {
             "schema": self.schema,
-            "prefix_len": len(self.schema),
+            "prefix_len": len(self.schema) + 1,
             "hwm": 1,
             "entries": [],
             "by_id": {}
         }
-        self.traverse(_tdb_to_list, state)
+
+        self.traverse(tdb_to_list, state)
 
         return state
 

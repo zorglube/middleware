@@ -1118,6 +1118,7 @@ class TDBWrapCRUDService(CRUDService):
     """
     service_version = {"major": 0, "minor": 1}
     tdb_path = None
+    tdb_defaults = []
     tdb_attach_fn = NotImplemented
     tdb_detach_fn = NotImplemented
     cluster_healthy_fn = 'ctdb.general.healthy'
@@ -1128,7 +1129,7 @@ class TDBWrapCRUDService(CRUDService):
 
     @private
     async def _default_tdb_attach(self):
-        tdb_name = f"{self._config.service}.tdb"
+        tdb_name = f"{self._config.namespace}.tdb"
         cmd = ["ctdb", "attach", tdb_name, "persistent"]
         attach = await async_run(cmd, check=False)
         if attach.returncode != 0:
@@ -1209,7 +1210,7 @@ class TDBWrapCRUDService(CRUDService):
             return res
 
         if not await self.cluster_healthy():
-            return []
+            return self.tdb_defaults.copy()
 
         if self.tdb_path is None:
             await self._initialize_tdb()
@@ -1221,14 +1222,14 @@ class TDBWrapCRUDService(CRUDService):
         data = res['data']
 
         if data is None:
-            return []
+            return self.tdb_defaults.copy()
 
         if version and self.service_version != version:
             self.logger.error(
                 "%s: Service version mismatch. Service update migration is required. "
                 "Returning default values.", self._config.namespace
             )
-            return []
+            return self.tdb_defaults.copy()
 
         if not self._config.datastore_extend:
             return filter_list(data, filters, options)
@@ -1237,6 +1238,9 @@ class TDBWrapCRUDService(CRUDService):
         for entry in data:
             extended = await self.middleware.call(self._config.datastore_extend, entry)
             to_filter.append(extended)
+
+        if not to_filter and self.tdb_defaults:
+            to_filter = self.tdb_defaults.copy()
 
         return filter_list(to_filter, filters, options)
 

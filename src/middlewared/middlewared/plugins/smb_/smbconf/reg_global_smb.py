@@ -11,46 +11,6 @@ LOGLEVEL_MAP = bidict({
 
 
 class GlobalSchema(RegistrySchema):
-    def convert_registry_to_schema(self, data_in, data_out):
-        """
-        This converts existing smb.conf shares into schema used
-        by middleware. It is only used in clustered configuration.
-        """
-        to_remove = [
-            'dns proxy',
-            'bind interfaces only',
-            'disable spoolss',
-            'load printers',
-            'printcap name',
-            'enable web service discovery',
-            'unix extensions',
-        ]
-        to_check = {
-            'restrict anonymous': 2,
-            'dos filemode': True,
-            'max log size': 5120,
-        }
-        super().convert_registry_to_schema(data_in, data_out)
-
-        # remove items that should never appear in auxiliary parameters
-        for i in to_remove:
-            data_in.pop(i, None)
-
-        # remove our defaults unless they've been modified by auxiliary
-        # parameters
-        for k, v in to_check.items():
-            val = data_in.get(k)
-            if val is None:
-                continue
-
-            if val['parsed'] == v:
-                data_in.pop(k)
-
-        aux_list = [f'{k} = {v["raw"]}' for k, v in data_in.items()]
-        data_out['smb_options'] = '\n'.join(aux_list)
-
-        return
-
     def smb_proto_transform(entry, conf):
         val = conf.pop(entry.smbconf, entry.default)
         if val == entry.default:
@@ -127,24 +87,18 @@ class GlobalSchema(RegistrySchema):
         return
 
     schema = [
-        RegObj("netbiosname", "tn:netbiosname", "truenas"),
-        RegObj("netbiosname_b", "tn:netbiosname_b", "truenas-b"),
         RegObj("netbiosname_local", "netbios name", ""),
         RegObj("workgroup", "workgroup", "WORKGROUP"),
-        RegObj("cifs_SID", "tn:sid", ""),
-        RegObj("next_rid", "tn:next_rid", -1),
         RegObj("netbiosalias", "netbios aliases", []),
         RegObj("description", "server string", ""),
         RegObj("enable_smb1", "server min protocol", False,
                smbconf_parser=smb_proto_transform, schema_parser=set_min_protocol),
         RegObj("unixcharset", "unix charset", "UTF8"),
         RegObj("syslog", "syslog only", False),
-        RegObj("aapl_extensions", "tn:fruit_enabled", False),
         RegObj("localmaster", "local master", False),
         RegObj("loglevel", "log level", "MINIMUM",
                smbconf_parser=log_level_transform, schema_parser=set_log_level),
         RegObj("guest", "guest account", "nobody"),
-        RegObj("admin_group", "tn:admin_group", ""),
         RegObj("filemask", "create mask", "0775",
                smbconf_parser=mask_transform, schema_parser=set_mask),
         RegObj("dirmask", "directory mask", "0775",

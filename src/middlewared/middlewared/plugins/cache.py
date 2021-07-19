@@ -12,6 +12,7 @@ import json
 import pwd
 import grp
 import os
+import errno
 
 
 class ClusterCacheService(Service):
@@ -29,7 +30,7 @@ class ClusterCacheService(Service):
             return
 
         raise CallError("ctdb must be enabled and healthy in order "
-                        "to access clustered cache")
+                        "to access clustered cache", errno.ENXIO)
 
     async def _tdb_initialize(self):
         await self.is_clustered_fn()

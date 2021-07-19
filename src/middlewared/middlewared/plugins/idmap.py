@@ -4,13 +4,12 @@ import errno
 import os
 import datetime
 from middlewared.schema import accepts, Bool, Dict, Int, Patch, Str
-from middlewared.service import CallError, CRUDService, job, private, ValidationErrors, filterable
+from middlewared.service import CallError, TDBWrapCRUDService, job, private, ValidationErrors, filterable
 from middlewared.plugins.directoryservices import SSL
 import middlewared.sqlalchemy as sa
 from middlewared.utils import run, filter_list
 from middlewared.validators import Range
 from middlewared.plugins.smb import SMBCmd, WBCErr, SMBHAMODE
-from middlewared.plugins.smb_.smbconf.reg_idmap import IdmapSchema
 
 
 class DSType(enum.Enum):
@@ -176,7 +175,47 @@ class IdmapDomainModel(sa.Model):
     idmap_domain_certificate_id = sa.Column(sa.ForeignKey('system_certificate.id'), index=True, nullable=True)
 
 
-class IdmapDomainService(CRUDService):
+class IdmapDomainService(TDBWrapCRUDService):
+
+    tdb_defaults = [
+        {
+            "id": 1,
+            "name": "DS_TYPE_ACTIVEDIRECTORY",
+            "dns_domain_name": None,
+            "range_low": 90000001,
+            "range_high": 200000001,
+            "idmap_backend": "AUTORID",
+            "options": {
+                "rangesize": 10000000
+            },
+            "certificate": None
+        },
+        {
+            "id": 2,
+            "name": "DS_TYPE_LDAP",
+            "dns_domain_name": None,
+            "range_low": 10000,
+            "range_high": 90000000,
+            "idmap_backend": "LDAP",
+            "options": {
+                "ldap_base_dn": "",
+                "ldap_user_dn": "",
+                "ldap_url": "",
+                "ssl": "OFF"
+            },
+            "certificate": None
+        },
+        {
+            "id": 5,
+            "name": "DS_TYPE_DEFAULT_DOMAIN",
+            "dns_domain_name": None,
+            "range_low": 90000001,
+            "range_high": 100000000,
+            "idmap_backend": "TDB",
+            "options": {},
+            "certificate": None
+        }
+    ]
 
     class Config:
         namespace = 'idmap'
@@ -428,8 +467,9 @@ class IdmapDomainService(CRUDService):
             verrors.add(f'{schema_name}.certificate', 'Please specify a valid certificate.')
 
         configured_domains = await self.query()
-        ldap_enabled = False if await self.middleware.call('ldap.get_state') == 'DISABLED' else True
-        ad_enabled = False if await self.middleware.call('activedirectory.get_state') == 'DISABLED' else True
+        ds_state = await self.middleware.call("directoryservices.get_state")
+        ldap_enabled = ds_state['ldap'] != 'DISABLED'
+        ad_enabled = ds_state['activedirectory'] != 'DISABLED'
         new_range = range(data['range_low'], data['range_high'])
         idmap_backend = data.get('idmap_backend')
         for i in configured_domains:
@@ -612,7 +652,6 @@ class IdmapDomainService(CRUDService):
         `RID` backend options:
         `sssd_compat` generate idmap low range based on same algorithm that SSSD uses by default.
         """
-        await self.middleware.call("smb.cluster_check")
         verrors = ValidationErrors()
         ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
 
@@ -654,16 +693,11 @@ class IdmapDomainService(CRUDService):
         final_options = IdmapBackend[data['idmap_backend']].defaults()
         final_options.update(data['options'])
         data['options'] = final_options
-        if ha_mode == SMBHAMODE.CLUSTERED:
-            return await self.reg_create(old, data)
 
-        data["id"] = await self.middleware.call(
-            "datastore.insert", self._config.datastore, data,
-            {
-                "prefix": self._config.datastore_prefix
-            },
-        )
-        return await self._get_instance(data['id'])
+        id = await super().do_create(data)
+        out = await self.query([('id', '=', id)], {'get': True})
+        await self.synchronize()
+        return out
 
     @accepts(
         Int('id', required=True),
@@ -677,10 +711,8 @@ class IdmapDomainService(CRUDService):
         """
         Update a domain by id.
         """
-        await self.middleware.call("smb.cluster_check")
-        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
 
-        old = await self.query([('id', '=', id)], {'get': True, 'extra': {'ha_mode': ha_mode.name}})
+        old = await self.query([('id', '=', id)], {'get': True})
         new = old.copy()
         if data.get('idmap_backend') and data['idmap_backend'] != old['idmap_backend']:
             """
@@ -739,20 +771,13 @@ class IdmapDomainService(CRUDService):
                                        domain, secret)
             await self.middleware.call("directoryservices.backup_secrets")
 
-        if ha_mode == SMBHAMODE.CLUSTERED:
-            return await self.reg_update(new)
+        await super().do_update(id, new)
 
-        await self.idmap_compress(new)
-        await self.middleware.call(
-            'datastore.update',
-            self._config.datastore,
-            id,
-            new,
-            {'prefix': self._config.datastore_prefix}
-        )
+        out = await self.query([('id', '=', id)], {'get': True})
+        await self.synchronize()
         cache_job = await self.middleware.call('idmap.clear_idmap_cache')
         await cache_job.wait()
-        return await self._get_instance(id)
+        return out
 
     @accepts(Int('id'))
     async def do_delete(self, id):
@@ -761,37 +786,13 @@ class IdmapDomainService(CRUDService):
         In case of registry config for clustered server, this will remove all smb4.conf
         entries for the domain associated with the id.
         """
-        await self.middleware.call("smb.cluster_check")
         if id <= 5:
             entry = await self._get_instance(id)
             raise CallError(f'Deleting system idmap domain [{entry["name"]}] is not permitted.', errno.EPERM)
 
-        ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
-        if ha_mode != SMBHAMODE.CLUSTERED:
-            return await self.middleware.call("datastore.delete", self._config.datastore, id)
-
-        return await self.reg_delete(id)
-
-    @filterable
-    async def query(self, filters, options):
-        """
-        Query shares with filters. In clustered environments, local datastore query
-        is bypassed in favor of clustered registry.
-        """
-        extra = options.get('extra', {})
-        ha_mode_str = extra.get('ha_mode')
-        if ha_mode_str is None:
-            ha_mode = SMBHAMODE[(await self.middleware.call('smb.get_smb_ha_mode'))]
-        else:
-            ha_mode = SMBHAMODE[ha_mode_str]
-
-        if ha_mode == SMBHAMODE.CLUSTERED:
-            result = await self.reg_query(filters, options)
-
-        else:
-            result = await super().query(filters, options)
-
-        return result
+        ret = await super().delete(id)
+        await self.synchronize()
+        return ret
 
     @private
     async def name_to_sid(self, name):
@@ -903,43 +904,6 @@ class IdmapDomainService(CRUDService):
         return wb.stdout.decode().strip()
 
     @private
-    async def idmap_from_smbconf(self):
-        global_params = await self.middleware.call('smb.reg_globals')
-        rv = []
-        entries = {}
-        next_id = 6
-        workgroup = global_params['raw'].get('workgroup', {'raw': ""})
-        security = global_params['raw'].get('security', {'raw': ""})
-
-        for k, v in global_params['idmap'].items():
-            domain = k.strip("idmap config ")
-            domain = domain.split(":")[0].strip()
-            entry = k.split(":", 1)[1]
-            if not entries.get(domain):
-                entries[domain] = {
-                    "workgroup": workgroup,
-                    "security": security,
-                }
-
-            entries[domain].update({entry.strip(): v})
-
-        for key, entry in entries.items():
-            converted = {}
-            id = IdmapSchema(self.middleware, domain)
-            self.logger.debug("entry: %s", entry)
-            id.convert_registry_to_schema(entry, converted)
-            if converted['name'] in DSType.choices():
-                ds = DSType[converted['name']]
-                converted['id'] = ds.value
-            else:
-                converted['id'] = next_id
-                next_id += 1
-
-            rv.append(converted)
-
-        return rv
-
-    @private
     async def idmap_to_smbconf(self, data=None):
         rv = {}
         if data is None:
@@ -947,12 +911,10 @@ class IdmapDomainService(CRUDService):
         else:
             idmap = data
 
-        security = await self.middleware.call('smb.getparm', 'security', 'global')
-        server_role = await self.middleware.call('smb.getparm', 'server role', 'global')
+        ds_state = await self.middleware.call('directoryservices.get_state')
         workgroup = await self.middleware.call('smb.getparm', 'workgroup', 'global')
-        ad_enabled = (security.upper() == 'ADS')
-        # In this situation (since we're dealing with idmap backends) we simply check for items set if we have samba_schema
-        ldap_enabled = (server_role == 'member server' and security.upper() == 'USER')
+        ad_enabled = ds_state['activedirectory'] != 'DISABLED'
+        ldap_enabled = ds_state['ldap'] != 'DISABLED'
         ad_idmap = filter_list(idmap, [('name', '=', DSType.DS_TYPE_ACTIVEDIRECTORY.name)], {'get': True}) if ad_enabled else None
 
         for i in idmap:
@@ -1006,12 +968,7 @@ class IdmapDomainService(CRUDService):
         return rv
 
     @private
-    async def diff_conf_and_registry(self, data, to_check=None):
-        if to_check is None:
-            idmaps = await self.idmap_from_smbconf()
-        else:
-            idmaps = to_check
-
+    async def diff_conf_and_registry(self, data, idmaps):
         r = idmaps
         s_keys = set(data.keys())
         r_keys = set(r.keys())
@@ -1019,15 +976,11 @@ class IdmapDomainService(CRUDService):
         return {
             'added': {x: data[x] for x in s_keys - r_keys},
             'removed': {x: r[x] for x in r_keys - s_keys},
-            'modified': {x: (data[x], r[x]) for x in intersect if data[x] != r[x]},
+            'modified': {x: data[x] for x in intersect if data[x] != r[x]},
         }
 
     @private
     async def synchronize(self):
-        ha_mode = await self.middleware.call("smb.get_smb_ha_mode")
-        if ha_mode == "CLUSTERED":
-            return
-
         config_idmap = await self.query()
         idmaps = await self.idmap_to_smbconf(config_idmap)
         to_check = (await self.middleware.call('smb.reg_globals'))['idmap']
@@ -1042,45 +995,4 @@ class IdmapDomainService(CRUDService):
         whether to set default autorid range. Autorid is generally more
         efficient in ctdb.
         """
-        existing_idmap = (await self.middleware.call('smb.reg_globals'))['idmap']
-        if existing_idmap.get('idmap config * : range'):
-            return
-
-        diff = {"added": {
-            "idmap config * : backend": "autorid",
-            "idmap config * : range": "90000001 - 100000000"
-        }}
-        await self.middleware.call('smb.reg_apply_conf_diff', diff)
-
-    @private
-    async def reg_query(self, filters, options):
-        reg_idmap = await self.middleware.call('idmap.idmap_from_smbconf')
-        result = filter_list(reg_idmap, filters, options)
-        return result
-
-    @private
-    async def reg_create(self, old, data):
-        orig = old.copy()
-        orig.append(data)
-        smbconf = await self.idmap_to_smbconf(orig)
-        smbconfold = await self.idmap_to_smbconf(old)
-        diff = await self.diff_conf_and_registry(smbconf, smbconfold)
-        await self.middleware.call('smb.reg_apply_conf_diff', diff)
-        return await self.query([("id", "=", data['id'])], {'get': True, 'extra': {'ha_mode': 'CLUSTERED'}})
-
-    @private
-    async def reg_update(self, data):
-        orig = await self.query([("id", "!=", data['id'])], {'extra': {'ha_mode': 'CLUSTERED'}})
-        orig.append(data)
-        smbconf = await self.idmap_to_smbconf(orig)
-        diff = await self.diff_conf_and_registry(smbconf)
-        await self.middleware.call('smb.reg_apply_conf_diff', diff)
-        return await self.query([("id", "=", data['id'])], {'get': True, 'extra': {'ha_mode': 'CLUSTERED'}})
-
-    @private
-    async def reg_delete(self, id):
-        ha_mode = await self.middleware.call('smb.get_smb_ha_mode')
-        remaining = await self.query([('id', '!=', id)], {'extra': {'ha_mode': ha_mode.name}})
-        smbconf = await self.idmap_to_smbconf(remaining)
-        diff = await self.diff_conf_and_registry(smbconf)
-        await self.middleware.call('smb.reg_apply_conf_diff', {'removed': diff['removed']})
+        await self.synchronize()
