@@ -765,8 +765,9 @@ class SMBService(TDBWrapConfigService):
         await self.middleware.call("smb.cluster_check")
 
         verrors = ValidationErrors()
-        ad_enabled = (await self.middleware.call('activedirectory.get_state') != "DISABLED")
-        if ad_enabled:
+        # Skip this check if we're joining AD
+        ad_state = await self.middleware.call('activedirectory.get_state')
+        if ad_state in ['HEALTHY', 'FAULTED']:
             for i in ('workgroup', 'netbiosname', 'netbiosname_b', 'netbiosalias'):
                 if old[i] != new[i]:
                     verrors.add(f'smb_update.{i}',
@@ -808,6 +809,10 @@ class SMBService(TDBWrapConfigService):
             await self.middleware.call("smb.synchronize_group_mappings")
 
         return new_config
+
+    @private
+    async def simple_update(self, data):
+        await super().do_update(data)
 
     @private
     async def compress(self, data):

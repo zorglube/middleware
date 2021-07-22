@@ -17,7 +17,7 @@ from dns import resolver
 from middlewared.plugins.smb import SMBCmd, SMBPath, WBCErr
 from middlewared.schema import accepts, Bool, Dict, Int, List, Str
 from middlewared.service import job, private, TDBWrapConfigService, Service, ValidationError, ValidationErrors
-from middlewared.service_exception import CallError
+from middlewared.service_exception import CallError, MatchNotFound
 import middlewared.sqlalchemy as sa
 from middlewared.utils import run
 from middlewared.plugins.directoryservices import DSStatus
@@ -25,14 +25,6 @@ from middlewared.plugins.idmap import DSType
 import middlewared.utils.osc as osc
 
 from samba.dcerpc.messaging import MSG_WINBIND_ONLINE
-from samba.credentials import Credentials
-from samba.net import Net
-from samba.samba3 import param
-from samba.dcerpc import (nbt, netlogon)
-from samba import (ntstatus, NTSTATUSError)
-
-LP_CTX = param.get_context()
-FEATURE_SEAL = 4
 
 AD_SMBCONF_PARAMS = {
     "server role": "member server",
@@ -192,78 +184,6 @@ class ActiveDirectory_DNS(object):
         return found_servers
 
 
-class ActiveDirectory_Conn(object):
-    def __init__(self, **kwargs):
-        super(ActiveDirectory_Conn, self).__init__()
-        self.ad = kwargs.get('conf')
-        self.logger = kwargs.get('logger')
-        self.cred = Credentials()
-        self._init_creds()
-        self.netctx = Net(creds=self.cred, lp=LP_CTX)
-
-    def _init_creds(self):
-        LP_CTX.load(SMBPath.GLOBALCONF.platform())
-        self.cred.set_gensec_features(self.cred.get_gensec_features() | FEATURE_SEAL)
-        self.cred.guess()
-
-    def _init_machine_secrets(self):
-        try:
-            self.cred.set_machine_account(LP_CTX)
-        except NTSTATUSError as e:
-            if e.args[0] == ntstatus.NT_STATUS_CANT_ACCESS_DOMAIN_INFO:
-                return e.args[0]
-            else:
-                raise CallError(f"Failed to initialize machine account secrets: {e.args[1]}")
-
-        return ntstatus.NT_STATUS_SUCCESS
-
-    def _extend_creds(self):
-        status = self._init_machine_secrets()
-        if status == ntstatus.NT_STATUS_CANT_ACCESS_DOMAIN_INFO:
-            self.logger.warning(f"Failed to initialize secrets for domain [{self.ad['domainname']}]. "
-                                "attempting to use credentials from config file.")
-            self.cred.set_username(f"{self.ad['bindname']}@{self.ad['domainname'].upper()}")
-            self.cred.set_password(self.ad['bindpw'])
-
-    def _do_cldap(self):
-        try:
-            cldap_ret = self.netctx.finddc(
-                domain=self.ad['domainname'].upper(),
-                flags=nbt.NBT_SERVER_LDAP | nbt.NBT_SERVER_DS | nbt.NBT_SERVER_WRITABLE
-            )
-        except NTSTATUSError as e:
-            if e.args[0] == ntstatus.NT_STATUS_OBJECT_NAME_NOT_FOUND:
-                raise CallError(f"cldap connection to domain [{self.ad['domainname']}] "
-                                f"failed with error: {e.args[1]} This may indicate a DNS error.",
-                                errno.ENOENT)
-            else:
-                raise CallError(f"cldap connection to domain [{self.ad['domainname']}] "
-                                f"failed with error: {e[1]}.")
-
-        return cldap_ret
-
-    def conn_check(self, dc=None):
-        self._extend_creds()
-        if dc is None:
-            dc = self.get_pdc()
-        netlogon.netlogon(
-            f"ncacn_ip_tcp:{dc}[schannel,seal]", LP_CTX, self.cred
-        )
-        return True
-
-    def get_site(self):
-        cldap_ret = self._do_cldap()
-        return cldap_ret.client_site
-
-    def get_pdc(self):
-        cldap_ret = self._do_cldap()
-        return cldap_ret.pdc_dns_name
-
-    def get_domain(self):
-        cldap_ret = self._do_cldap()
-        return cldap_ret.domain_name
-
-
 class ActiveDirectoryModel(sa.Model):
     __tablename__ = 'directoryservice_activedirectory'
 
@@ -328,7 +248,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
             return
 
         for k, v in params.items():
-            if k is None:
+            if v is None:
                 continue
 
             data_out[k] = {"raw": str(v), "parsed": v}
@@ -351,9 +271,9 @@ class ActiveDirectoryService(TDBWrapConfigService):
     async def ad_extend(self, ad):
         smb = await self.middleware.call('smb.config')
         smb_ha_mode = await self.middleware.call('smb.get_smb_ha_mode')
-        if smb_ha_mode == 'STANDALONE':
+        if smb_ha_mode in ['STANDALONE', 'CLUSTERED']:
             ad.update({
-                'netbiosname': smb['netbiosname'],
+                'netbiosname': smb['netbiosname_local'],
                 'netbiosalias': smb['netbiosalias']
             })
         elif smb_ha_mode == 'UNIFIED':
@@ -373,7 +293,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
         if ad.get('nss_info'):
             ad['nss_info'] = ad['nss_info'].upper()
 
-        if ad.get('kerberos_realm'):
+        if ad.get('kerberos_realm') and type(ad['kerberos_realm']) == dict:
             ad['kerberos_realm'] = ad['kerberos_realm']['id']
 
         return ad
@@ -435,11 +355,19 @@ class ActiveDirectoryService(TDBWrapConfigService):
 
     @private
     async def common_validate(self, new, old, verrors):
+        if new['kerberos_realm'] and new['kerberos_realm'] != old['kerberos_realm']:
+            realm = await self.middleware.call('kerberos.realm.query', [("id", "=", new['kerberos_realm'])])
+            if not realm:
+                verrors.add(
+                    'activedirectory_update.kerberos_realm',
+                    'Invalid Kerberos realm id. Realm does not exist.'
+                )
+
         if not new["enable"]:
             return
 
-        ldap_enabled = (await self.middleware.call("ldap.config"))['enable']
-        if ldap_enabled:
+        ds_state = await self.middleware.call('directoryservices.get_state')
+        if ds_state['ldap'] != 'DISABLED':
             verrors.add(
                 "activedirectory_update.enable",
                 "Active Directory service may not be enabled while LDAP service is enabled."
@@ -584,6 +512,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
         new = old.copy()
         new.update(data)
         new['domainname'] = new['domainname'].upper()
+
         try:
             await self.update_netbios_data(old, new)
         except Exception as e:
@@ -591,8 +520,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
 
         await self.common_validate(new, old, verrors)
 
-        if verrors:
-            raise verrors
+        verrors.check()
 
         if new['enable'] and not old['enable']:
             """
@@ -604,12 +532,17 @@ class ActiveDirectoryService(TDBWrapConfigService):
                time offset will prevent libads from using the ticket for the domain
                join.
             """
+
             try:
-                await self.middleware.run_in_thread(self.validate_credentials, new)
-            except Exception as e:
+                await self.validate_credentials(new)
+            except CallError as e:
+                if new['kerberos_principal']:
+                    method = "activedirectory.kerberos_principal"
+                else:
+                    method = "activedirectory.bindpw"
+
                 raise ValidationError(
-                    "activedirectory_update.bindpw",
-                    f"Failed to validate bind credentials: {e}"
+                    method, f'Failed to validate bind credentials: {e.errmsg.split(":")[-1:][0]}'
                 )
 
             try:
@@ -625,30 +558,21 @@ class ActiveDirectoryService(TDBWrapConfigService):
                 )
 
         new = await self.ad_compress(new)
-        await super().do_update(new)
+        ret = await super().do_update(new)
 
         diff = await self.diff_conf_and_registry(new)
         await self.middleware.call('smb.reg_apply_conf_diff', diff)
 
-        start = False
-        stop = False
-
-        if not old['enable']:
-            if new['enable']:
-                start = True
-        else:
-            if not new['enable']:
-                stop = True
-
         job = None
-        if stop:
-            await self.stop()
-        if start:
+        if not old['enable'] and new['enable']:
             job = (await self.middleware.call('activedirectory.start')).id
 
-        if not stop and not start and new['enable']:
+        elif new['enable'] and not old['enable']:
+            await self.stop()
+
+        elif new['enable'] and old['enable']:
             await self.middleware.call('service.restart', 'cifs')
-        ret = await self.config()
+
         ret.update({'job_id': job})
         return ret
 
@@ -715,6 +639,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
         await self.middleware.call("smb.cluster_check")
         ad = await self.config()
         smb = await self.middleware.call('smb.config')
+        workgroup = smb['workgroup']
         smb_ha_mode = await self.middleware.call('smb.reset_smb_ha_mode')
         if smb_ha_mode == 'UNIFIED':
             if await self.middleware.call('failover.status') != 'MASTER':
@@ -746,7 +671,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
                 realm_id = await self.middleware.call('kerberos.realm.create',
                                                       {'realm': ad['domainname'].upper()})
 
-            super().do_update({"kerberos_realm": realm_id})
+            await self.direct_update({"kerberos_realm": realm_id})
             ad = await self.config()
 
         if not await self.middleware.call('kerberos._klist_test'):
@@ -761,16 +686,16 @@ class ActiveDirectoryService(TDBWrapConfigService):
 
         job.set_progress(20, 'Detecting Active Directory Site.')
         if not ad['site']:
-            new_site = await self.middleware.call('activedirectory.get_site')
-            if new_site != 'Default-First-Site-Name':
-                ad = await self.config()
+            new_site = await self.get_site()
+            if new_site and new_site != 'Default-First-Site-Name':
+                ad['site'] = new_site
                 await self.middleware.call('activedirectory.set_kerberos_servers', ad)
 
         job.set_progress(30, 'Detecting Active Directory NetBIOS Domain Name.')
-        if not smb['workgroup'] or smb['workgroup'] == 'WORKGROUP':
-            await self.middleware.call('activedirectory.get_netbios_domain_name')
+        if not workgroup or workgroup == 'WORKGROUP':
+            workgroup = await self.middleware.call('activedirectory.get_netbios_domain_name', smb['workgroup'])
 
-        await self.middleware.call('etc.generate', 'smb')
+        await self.middleware.call('smb.initialize_globals')
 
         """
         Check response of 'net ads testjoin' to determine whether the server needs to be joined to Active Directory.
@@ -780,11 +705,11 @@ class ActiveDirectoryService(TDBWrapConfigService):
         """
 
         job.set_progress(40, 'Performing testjoin to Active Directory Domain')
-        ret = await self._net_ads_testjoin(smb['workgroup'])
+        ret = await self._net_ads_testjoin(workgroup, ad)
         if ret == neterr.NOTJOINED:
             job.set_progress(50, 'Joining Active Directory Domain')
             self.logger.debug(f"Test join to {ad['domainname']} failed. Performing domain join.")
-            await self._net_ads_join()
+            await self._net_ads_join(ad)
             await self._register_virthostname(ad, smb, smb_ha_mode)
             if smb_ha_mode != 'LEGACY':
                 """
@@ -804,11 +729,10 @@ class ActiveDirectoryService(TDBWrapConfigService):
                 kt_id = await self.middleware.call('kerberos.keytab.store_samba_keytab')
                 if kt_id:
                     self.logger.debug('Successfully generated keytab for computer account. Clearing bind credentials')
-                    super().do_update({
+                    ad = await self.direct_update({
                         'bindpw': '',
                         'kerberos_principal': f'{ad["netbiosname"].upper()}$@{ad["domainname"]}'
                     })
-                    ad = await self.config()
 
             ret = neterr.JOINED
 
@@ -845,7 +769,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
     @private
     async def stop(self):
         await self.middleware.call("smb.cluster_check")
-        super().do_update({"enable": False})
+        await super().do_update({"enable": False})
         await self.set_state(DSStatus['LEAVING'])
         await self.middleware.call('admonitor.stop')
         await self.middleware.call('etc.generate', 'hostname')
@@ -867,32 +791,23 @@ class ActiveDirectoryService(TDBWrapConfigService):
                 self.logger.warning('Failed to stop active directory service on standby controller', exc_info=True)
 
     @private
-    def validate_credentials(self, ad=None):
+    async def validate_credentials(self, ad=None):
         """
         Kinit with user-provided credentials is sufficient to determine
         whether the credentials are good. A testbind here is unnecessary.
         """
-        if self.middleware.call_sync('kerberos._klist_test'):
+        if await self.middleware.call('kerberos._klist_test'):
             # Short-circuit credential validation if we have a valid tgt
             return
 
         if ad is None:
-            ad = self.middleware.call_sync('activedirectory.config')
+            ad = await self.middleware.call('activedirectory.config')
 
         data = ad.copy()
         data['dstype'] = DSType.DS_TYPE_ACTIVEDIRECTORY.value
 
-        try:
-            self.middleware.call_sync('kerberos.do_kinit', data)
-        except Exception:
-            realm = self.middleware.call_sync(
-                'kerberos.realm.query',
-                [('realm', '=', ad['domainname'])],
-                {'get': True}
-            )
-            self.middleware.call_sync('kerberos.realm.delete', realm['id'])
-            raise
-        return True
+        await self.middleware.call('kerberos.do_kinit', data)
+        return
 
     @private
     def check_clockskew(self, ad=None):
@@ -905,22 +820,14 @@ class ActiveDirectoryService(TDBWrapConfigService):
         """
         permitted_clockskew = datetime.timedelta(minutes=3)
         nas_time = datetime.datetime.now()
-        if not ad:
-            ad = self.middleware.call_sync('activedirectory.config')
 
         try:
-            pdc = ActiveDirectory_Conn(conf=ad, logger=self.logger).get_pdc()
-            if not pdc:
-                self.logger.warning("Unable to find PDC emulator via DNS.")
-                return {'pdc': None, 'timestamp': '0', 'clockskew': 0}
-        except CallError:
-            AD_DNS = ActiveDirectory_DNS(conf=ad, logger=self.logger)
-            res = AD_DNS.get_n_working_servers(SRV['DOMAINCONTROLLER'], 1)
-            if len(res) == 0:
-                self.logger.warning("Unable to find Domain Controller via DNS.")
-                return {'pdc': None, 'timestamp': '0', 'clockskew': 0}
+            lookup = self.middleware.call_sync('activedirectory.lookup_dc')
+        except CallError as e:
+            self.logger.warning(e.errmsg)
+            return {'pdc': None, 'timestamp': '0', 'clockskew': 0}
 
-            pdc = res[0]['host']
+        pdc = lookup["Information for Domain Controller"]
 
         c = ntplib.NTPClient()
         response = c.request(pdc)
@@ -980,20 +887,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
                 self.logger.warning("Failed to get DC info from winbindd: %s", wb_dcinfo.stderr.decode())
                 dc = res[0]['host']
 
-        try:
-            ret = ActiveDirectory_Conn(conf=data, logger=self.logger).conn_check(dc)
-        except NTSTATUSError as e:
-            if e.args[0] == ntstatus.NT_STATUS_NO_TRUST_SAM_ACCOUNT:
-                raise CallError("No SAM Trust Account for this TrueNAS server exists "
-                                f"on Domain Controller [{dc}]. This may indicate problems "
-                                "with replication between Domain Controllers in the Active "
-                                "Directory domain and may impact file sharing services "
-                                "dependent on SAM account information being consistent among "
-                                "domain controllers", errno=errno.ENOENT)
-
-            raise CallError(f"Netlogon connection to [{dc}] failed with error: {e.args[1]}")
-
-        return ret
+        return True
 
     @accepts()
     async def started(self):
@@ -1013,7 +907,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
         try:
             verrors.check()
         except Exception:
-            super().do_update({"enable": False})
+            self.direct_update({"enable": False})
             raise CallError('Automatically disabling ActiveDirectory service due to invalid configuration.',
                             errno.EINVAL)
 
@@ -1039,8 +933,13 @@ class ActiveDirectoryService(TDBWrapConfigService):
 
             raise CallError(wberr, err)
 
+        if (await self.middleware.call('smb.get_smb_ha_mode')) == 'CLUSTERED':
+            state_method = 'cluster_cache.get'
+        else:
+            state_method = 'cache.get'
+
         try:
-            cached_state = await self.middleware.call('cache.get', 'DS_STATE')
+            cached_state = await self.middleware.call(state_method, 'DS_STATE')
 
             if cached_state['activedirectory'] != 'HEALTHY':
                 await self.set_state(DSStatus['HEALTHY'])
@@ -1056,7 +955,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
         dynamic DNS updates after joining AD to register
         VIP addresses.
         """
-        if not ad['allow_dns_updates'] or smb_ha_mode == 'STANDALONE':
+        if not ad['allow_dns_updates'] or smb_ha_mode in ['STANDALONE', 'CLUSTERED']:
             return
 
         vhost = (await self.middleware.call('network.configuration.config'))['hostname_virtual']
@@ -1090,8 +989,11 @@ class ActiveDirectoryService(TDBWrapConfigService):
             raise CallError(msg[1])
 
     @private
-    async def _net_ads_join(self):
-        ad = await self.config()
+    async def _net_ads_join(self, ad=None):
+        await self.middleware.call("kerberos.check_ticket")
+        if ad is None:
+            ad = await self.config()
+
         if ad['createcomputer']:
             netads = await run([
                 SMBCmd.NET.value, '-k', '-U', ad['bindname'], '-d', '5',
@@ -1107,7 +1009,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
             await self._parse_join_err(netads.stdout.decode().split(':', 1))
 
     @private
-    async def _net_ads_testjoin(self, workgroup):
+    async def _net_ads_testjoin(self, workgroup, ad=None):
         """
         If neterr.NOTJOINED is returned then we will proceed with joining (or re-joining)
         the AD domain. There are currently two reasons to do this:
@@ -1118,7 +1020,10 @@ class ActiveDirectoryService(TDBWrapConfigService):
         In this case, the error message presents oddly because stale credentials are stored in
         the secrets.tdb file and the message is passed up from underlying KRB5 library.
         """
-        ad = await self.config()
+        await self.middleware.call("kerberos.check_ticket")
+        if ad is None:
+            ad = await self.config()
+
         netads = await run([
             SMBCmd.NET.value, '-k', '-w', workgroup,
             '-d', '5', 'ads', 'testjoin', ad['domainname']],
@@ -1160,6 +1065,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
         Directory computer account. This may not reflect the state of the
         server's current kerberos keytab.
         """
+        await self.middleware.call("kerberos.check_ticket")
         spnlist = []
         netads = await run([SMBCmd.NET.value, '-k', 'ads', 'setspn', 'list'], check=False)
         if netads.returncode != 0:
@@ -1180,6 +1086,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
         Force an update of the AD machine account password. This can be used to
         refresh the Kerberos principals in the server's system keytab.
         """
+        await self.middleware.call("kerberos.check_ticket")
         workgroup = (await self.middleware.call('smb.config'))['workgroup']
         netads = await run([SMBCmd.NET.value, '-k', 'ads', '-w', workgroup, 'changetrustpw'], check=False)
         if netads.returncode != 0:
@@ -1225,6 +1132,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
 
         `Last machine account password change`. timestamp
         """
+        await self.middleware.call("kerberos.check_ticket")
         netads = await run([SMBCmd.NET.value, '-k', 'ads', 'info', '--json'], check=False)
         if netads.returncode != 0:
             raise CallError(netads.stderr.decode())
@@ -1232,7 +1140,7 @@ class ActiveDirectoryService(TDBWrapConfigService):
         return json.loads(netads.stdout.decode())
 
     @private
-    def get_netbios_domain_name(self):
+    async def get_netbios_domain_name(self, workgroup=None):
         """
         The 'workgroup' parameter must be set correctly in order for AD join to
         succeed. This is based on the short form of the domain name, which was defined
@@ -1241,17 +1149,24 @@ class ActiveDirectoryService(TDBWrapConfigService):
         queries and sets it.
         """
 
-        ret = False
-        ad = self.middleware.call_sync('activedirectory.config')
-        smb = self.middleware.call_sync('smb.config')
+        if workgroup is None:
+            workgroup = (await self.middleware.call_sync('smb.config'))['workgroup']
 
-        domain = ActiveDirectory_Conn(conf=ad, logger=self.logger).get_domain()
+        netcmd = await run([SMBCmd.NET.value, 'ads', 'workgroup'], check=False)
+        if netcmd.returncode != 0:
+            raise CallError(
+                "Failed to retrieve netbios domain name from Active Directory: "
+                f"{netcmd.stderr.decode().strip}"
+            )
 
-        if domain and smb['workgroup'] != ret:
+        output = netcmd.stdout.decode()
+        domain = output.split()[1].strip()
+
+        if domain != workgroup:
             self.logger.debug(f'Updating SMB workgroup to match the short form of the AD domain [{ret}]')
             self.middleware.call_sync('smb.update', {'workgroup': domain})
 
-        return ret
+        return domain
 
     @private
     def get_kerberos_servers(self, ad=None):
@@ -1294,48 +1209,53 @@ class ActiveDirectoryService(TDBWrapConfigService):
             self.middleware.call_sync('etc.generate', 'kerberos')
 
     @private
-    def set_ntp_servers(self):
+    async def set_ntp_servers(self):
         """
         Appropriate time sources are a requirement for an AD environment. By default kerberos authentication
         fails if there is more than a 5 minute time difference between the AD domain and the member server.
-        If the NTP servers are the default that we ship the NAS with. If this is the case, then we will
-        discover the Domain Controller with the PDC emulator FSMO role and set it as the preferred NTP
-        server for the NAS.
         """
-        ntp_servers = self.middleware.call_sync('system.ntpserver.query')
-        ntp_pool = 'freebsd.pool.ntp.og' if osc.IS_FREEBSD else 'debian.pool.ntp.org'
+        ntp_servers = await self.middleware.call('system.ntpserver.query')
+        ntp_pool = 'debian.pool.ntp.org'
         default_ntp_servers = list(filter(lambda x: ntp_pool in x['address'], ntp_servers))
         if len(ntp_servers) != 3 or len(default_ntp_servers) != 3:
             return
 
-        ad = self.middleware.call_sync('activedirectory.config')
-        pdc = ActiveDirectory_Conn(conf=ad, logger=self.logger).get_pdc()
-        if not pdc:
-            self.logger.warning("Unable to detect PDC emulator for domain. "
-                                "Failed to automatically set time source.")
+        try:
+            dc = (await self.lookup_dc())["Information for Domain Controller"]
+        except CallError:
+            self.logger.warning("Failed to automatically set time source.", exc_info=True)
             return
 
         try:
-            self.middleware.call_sync('system.ntpserver.create', {'address': pdc, 'prefer': True})
+            await self.middleware.call('system.ntpserver.create', {'address': dc, 'prefer': True})
         except Exception:
             self.logger.warning('Failed to configure NTP for the Active Directory domain. Additional '
                                 'manual configuration may be required to ensure consistent time offset, '
                                 'which is required for a stable domain join.', exc_info=True)
+        return
 
     @private
-    def get_site(self):
-        """
-        First, use DNS to identify domain controllers
-        Then, find a domain controller that is listening for LDAP connection if this information is not cached.
-        Then, perform an LDAP query to determine our AD site
-        """
-        ad = self.middleware.call_sync('activedirectory.config')
-        site = ActiveDirectory_Conn(conf=ad, logger=self.logger).get_site()
+    async def lookup_dc(self, ad=None):
+        if ad is None:
+            ad = await self.config()
 
-        if not ad['site']:
-            super().do_update({"site": site})
+        lookup = await run([SMBCmd.NET.value, '--json', '-S', ad['domainname'], 'ads', 'lookup'], check=False)
+        if lookup.returncode != 0:
+            raise CallError("Failed to look up Domain Controller information: "
+                            f"{lookup.stderr.decode().strip()}")
 
-        return site
+        out = json.loads(lookup.stdout.decode())
+        return out
+
+    @private
+    async def get_site(self):
+        try:
+            lookup = await self.lookup_dc()
+        except CallError as e:
+             self.logger.warning("Failed to get AD site: %s", e)
+             return None
+
+        return lookup["Client Site Name"]
 
     @accepts(
         Dict(
@@ -1373,11 +1293,14 @@ class ActiveDirectoryService(TDBWrapConfigService):
                 [('name', '=', 'AD_MACHINE_ACCOUNT')]
             )
             if krb_princ:
-                await self.middleware.call('kerberos.keytab.delete', krb_princ[0]['id'])
+                await self.middleware.call('kerberos.keytab.direct_delete', krb_princ[0]['id'])
 
-        await self.middleware.call('kerberos.realm.delete', ad['kerberos_realm'])
+        try:
+            await self.middleware.call('kerberos.realm.direct_delete', ad['kerberos_realm'])
+        except MatchNotFound:
+            pass
 
-        if netads.returncode == 0:
+        if netads.returncode == 0 and smb_ha_mode != 'CLUSTERED':
             try:
                 pdir = await self.middleware.call("smb.getparm", "private directory", "GLOBAL")
                 ts = time.time()
@@ -1386,7 +1309,13 @@ class ActiveDirectoryService(TDBWrapConfigService):
             except Exception:
                 self.logger.debug("Failed to remove stale secrets file.", exc_info=True)
 
-        await self.middleware.call('activedirectory.update', {'enable': False, 'site': None})
+        payload = {
+            'enable': False,
+            'site': None,
+            'kerberos_realm': None,
+            'domainname': '',
+        }
+        await self.middleware.call('activedirectory.update', payload)
         if smb_ha_mode == 'LEGACY' and (await self.middleware.call('failover.status')) == 'MASTER':
             try:
                 await self.middleware.call('failover.call_remote', 'activedirectory.leave', [data])
@@ -1397,7 +1326,8 @@ class ActiveDirectoryService(TDBWrapConfigService):
         if flush.returncode != 0:
             self.logger.warning("Failed to flush samba's general cache after leaving Active Directory.")
 
-        self.logger.debug("Successfully left domain: %s", ad['domainname'])
+        await self.middleware.call('kerberos.stop')
+        return
 
     @private
     @job(lock='fill_ad_cache')

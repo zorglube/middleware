@@ -187,7 +187,6 @@ class SharingSMBService(Service):
 
         if gl['fruit_enabled'] is None:
             smbconf = await self.middleware.call('smb.config')
-            self.logger.debug("XXX: %s", smbconf)
             gl['fruit_enabled'] = smbconf['aapl_extensions']
 
         return gl

@@ -523,6 +523,9 @@ class TDBWrapConfigService(ConfigService):
     status = None
     last_check = 0
     time_offset = 30
+    cached_config = None
+    config_last_check = 0
+    config_time_offset = 1
 
     @private
     async def _default_tdb_attach(self):
@@ -595,6 +598,18 @@ class TDBWrapConfigService(ConfigService):
 
         return status
 
+    @private
+    async def get_config(self):
+        now = time.monotonic()
+        if self.config_last_check + self.config_time_offset > now:
+            return copy.deepcopy(self.cached_config)
+
+        t = TDBWrapConfig(self.tdb_path, self._config.namespace)
+        tdb_config = t.config()
+        self.cached_config = copy.deepcopy(tdb_config)
+        self.config_last_check = now
+        return tdb_config
+
     @accepts()
     async def config(self):
         is_clustered = await self.is_clustered()
@@ -602,33 +617,32 @@ class TDBWrapConfigService(ConfigService):
             return await super().config()
 
         if not await self.cluster_healthy():
-            return self.tdb_defaults.copy()
+            return copy.deepcopy(self.tdb_defaults)
 
         if self.tdb_path is None:
             await self._initialize_tdb()
 
-        t = TDBWrapConfig(self.tdb_path, self._config.namespace)
-        tdb_config = t.config()
-
+        tdb_config = await self.get_config()
         version = tdb_config['version']
         data = tdb_config['data']
 
         if data is None:
-            data = self.tdb_defaults.copy()
+            data = copy.deepcopy(self.tdb_defaults)
 
         if version and self.service_version != version:
             self.logger.error(
                 "%s: Service version mismatch. Service update migration is required. "
                 "Returning default values.", self._config.namespace
             )
-            data = self.tdb_defaults.copy()
+            data = copy.deepcopy(self.tdb_defaults)
 
         if not self._config.datastore_extend:
             return data
 
         return await self.middleware.call(self._config.datastore_extend, data)
 
-    async def do_update(self, data):
+    @private
+    async def direct_update(self, data):
         is_clustered = await self.is_clustered()
         if not is_clustered:
             id = data.pop("id", 1)
@@ -652,7 +666,7 @@ class TDBWrapConfigService(ConfigService):
         version = old['version']
         new = old['data']
         if new is None:
-            new = self.tdb_defaults.copy()
+            new = copy.deepcopy(self.tdb_defaults)
 
         new.update(data)
         payload = {"version": self.service_version, "data": new}
@@ -666,12 +680,17 @@ class TDBWrapConfigService(ConfigService):
             )
 
         tdb_config = t.config()
+        self.cached_config = copy.deepcopy(tdb_config)
+        self.config_last_check = time.monotonic()
 
         if not self._config.datastore_extend:
             return tdb_config["data"]
 
         return await self.middleware.call(self._config.datastore_extend, tdb_config["data"])
 
+    async def do_update(self, data):
+        res = await self.direct_update(data)
+        return res
 
 class SystemServiceService(ConfigService):
     """
@@ -1198,6 +1217,17 @@ class TDBWrapCRUDService(CRUDService):
 
         return status
 
+    @private
+    async def insert_defaults(self, handle):
+        # ctdb tool need json input for list of changes to be
+        # completed in a single transaction
+        for entry in self.tdb_defaults:
+            tdb_key = f'{self._config.namespace}_{entry["id"]}'
+            val = entry.copy()
+            val.pop("id")
+            tdb_val = json.dumps(val)
+            handle.set(tdb_key, tdb_val)
+
     @filterable
     async def query(self, filters, options):
         is_clustered = await self.is_clustered()
@@ -1210,7 +1240,7 @@ class TDBWrapCRUDService(CRUDService):
             return res
 
         if not await self.cluster_healthy():
-            return self.tdb_defaults.copy()
+            return copy.deepcopy(self.tdb_defaults)
 
         if self.tdb_path is None:
             await self._initialize_tdb()
@@ -1222,14 +1252,14 @@ class TDBWrapCRUDService(CRUDService):
         data = res['data']
 
         if data is None:
-            return self.tdb_defaults.copy()
+            return copy.deepcopy(tdb_defaults)
 
         if version and self.service_version != version:
             self.logger.error(
                 "%s: Service version mismatch. Service update migration is required. "
                 "Returning default values.", self._config.namespace
             )
-            return self.tdb_defaults.copy()
+            return copy.deepcopy(self.tdb_defaults)
 
         if not self._config.datastore_extend:
             return filter_list(data, filters, options)
@@ -1240,11 +1270,13 @@ class TDBWrapCRUDService(CRUDService):
             to_filter.append(extended)
 
         if not to_filter and self.tdb_defaults:
-            to_filter = self.tdb_defaults.copy()
+            await self.insert_defaults(t)
+            to_filter = copy.deepcopy(self.tdb_defaults)
 
         return filter_list(to_filter, filters, options)
 
-    async def do_create(self, data):
+    @private
+    async def direct_create(self, data):
         is_clustered = await self.is_clustered()
         if not is_clustered:
             id = await self.middleware.call(
@@ -1272,7 +1304,12 @@ class TDBWrapCRUDService(CRUDService):
 
         return res
 
-    async def do_update(self, id, data):
+    async def do_create(self, data):
+        res = await self.direct_create(data)
+        return res
+
+    @private
+    async def direct_update(self, id, data):
         is_clustered = await self.is_clustered()
         if not is_clustered:
             res = await self.middleware.call(
@@ -1300,7 +1337,12 @@ class TDBWrapCRUDService(CRUDService):
 
         return res
 
-    async def do_delete(self, id):
+    async def do_update(self, id, data):
+        res = await self.direct_update(id, data)
+        return res
+
+    @private
+    async def direct_delete(self, id):
         is_clustered = await self.is_clustered()
         if not is_clustered:
             return await self.middleware.call("datastore.delete", self._config.datastore, id)
@@ -1314,6 +1356,10 @@ class TDBWrapCRUDService(CRUDService):
         t = TDBWrapCRUD(self.tdb_path, self._config.namespace)
         res = t.delete(id)
 
+        return res
+
+    async def do_delete(self, id):
+        res = await self.direct_delete(id)
         return res
 
 

@@ -261,10 +261,10 @@ class TDBWrapCRUD(CTDBWrap):
             raise MatchNotFound()
 
         old.update(new)
-        old.pop('id')
+        old_id = old.pop('id')
         tdb_val = json.dumps(old)
         self.set(tdb_key, tdb_val)
-        return
+        return old_id
 
     def delete(self, id):
         tdb_key = f'{self.schema}_{id}'

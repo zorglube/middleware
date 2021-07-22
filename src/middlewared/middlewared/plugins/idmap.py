@@ -468,8 +468,8 @@ class IdmapDomainService(TDBWrapCRUDService):
 
         configured_domains = await self.query()
         ds_state = await self.middleware.call("directoryservices.get_state")
-        ldap_enabled = ds_state['ldap'] != 'DISABLED'
-        ad_enabled = ds_state['activedirectory'] != 'DISABLED'
+        ldap_enabled = True if ds_state['ldap'] in ['HEALTHY', 'JOINING'] else False
+        ad_enabled = True if ds_state['activedirectory'] in ['HEALTHY', 'JOINING'] else False
         new_range = range(data['range_low'], data['range_high'])
         idmap_backend = data.get('idmap_backend')
         for i in configured_domains:
@@ -693,7 +693,7 @@ class IdmapDomainService(TDBWrapCRUDService):
         final_options.update(data['options'])
         data['options'] = final_options
 
-        id = await super().do_create(data)
+        data['id'] = await super().do_create(data)
         out = await self.query([('id', '=', id)], {'get': True})
         await self.synchronize()
         return out
@@ -770,7 +770,7 @@ class IdmapDomainService(TDBWrapCRUDService):
                                        domain, secret)
             await self.middleware.call("directoryservices.backup_secrets")
 
-        await super().do_update(id, new)
+        ret = await super().do_update(id, new)
 
         out = await self.query([('id', '=', id)], {'get': True})
         await self.synchronize()
@@ -912,8 +912,8 @@ class IdmapDomainService(TDBWrapCRUDService):
 
         ds_state = await self.middleware.call('directoryservices.get_state')
         workgroup = await self.middleware.call('smb.getparm', 'workgroup', 'global')
-        ad_enabled = ds_state['activedirectory'] != 'DISABLED'
-        ldap_enabled = ds_state['ldap'] != 'DISABLED'
+        ad_enabled = ds_state['activedirectory'] in ['HEALTHY', 'JOINING', 'FAULTED']
+        ldap_enabled = ds_state['ldap'] in ['HEALTHY', 'JOINING', 'FAULTED']
         ad_idmap = filter_list(idmap, [('name', '=', DSType.DS_TYPE_ACTIVEDIRECTORY.name)], {'get': True}) if ad_enabled else None
 
         for i in idmap:

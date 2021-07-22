@@ -165,6 +165,14 @@ class KerberosService(TDBWrapConfigService):
         return True
 
     @private
+    async def check_ticket(self):
+        valid_ticket = await self._klist_test()
+        if not valid_ticket:
+            raise CallError("Kerberos ticket is required.", errno.ENOKEY)
+
+        return
+
+    @private
     async def _validate_param_type(self, data):
         supported_validation_types = [
             'boolean',
@@ -749,7 +757,7 @@ class KerberosKeytabService(TDBWrapCRUDService):
         if verrors:
             raise verrors
 
-        id = super().do_create(data)
+        id = await super().do_create(data)
         await self.middleware.call('etc.generate', 'kerberos')
 
         return await self._get_instance(id)
@@ -1089,13 +1097,13 @@ class KerberosKeytabService(TDBWrapCRUDService):
         entry = await self.query([('name', '=', 'AD_MACHINE_ACCOUNT')])
         if not entry:
             await self.middleware.call(
-                'kerberos.keytab.create',
+                'kerberos.keytab.direct_create',
                 {'name': 'AD_MACHINE_ACCOUNT', 'file': keytab_file}
             )
         else:
             id = entry[0]['id']
-            updated_entry = {'keytab_name': 'AD_MACHINE_ACCOUNT', 'keytab_file': keytab_file}
-            await self.middleware.call('kerberos.keytab.update', id, updated_entry)
+            updated_entry = {'name': 'AD_MACHINE_ACCOUNT', 'file': keytab_file}
+            await self.middleware.call('kerberos.keytab.direct_update', id, updated_entry)
 
         sambakt = await self.query([('name', '=', 'AD_MACHINE_ACCOUNT')])
         if sambakt:

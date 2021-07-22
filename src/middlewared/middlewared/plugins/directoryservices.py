@@ -371,6 +371,9 @@ class DirectoryServices(Service):
         we have in our database.
         """
         ha_mode = self.middleware.call_sync('smb.get_smb_ha_mode')
+        if ha_mode == 'CLUSTERED':
+            return
+
         smb_config = self.middleware.call_sync('smb.config')
         if domain is None:
             domain = smb_config['workgroup']

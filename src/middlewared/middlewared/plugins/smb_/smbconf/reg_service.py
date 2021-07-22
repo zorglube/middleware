@@ -300,12 +300,10 @@ class ShareSchema(RegistrySchema):
         return "zfs_fsrvp" in vfs_objects
 
     def fsrvp_set(entry, val, data_in, data_out):
-        """
-        XXX: currently a no-op
-        """
         if not val:
             return
 
+        data_out['vfs objects']['parsed'].append("zfs_fsrvp")
         return
 
     def streams_get(entry, conf):
