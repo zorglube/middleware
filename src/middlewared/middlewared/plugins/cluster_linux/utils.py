@@ -46,6 +46,10 @@ class CTDBConfig(enum.Enum):
     # of the config
     GENERAL_FILE = 'ctdb.conf'
 
+    # name of dir where private data readable by root should be
+    # localated
+    SECRETS_DIR = 'ctdb_secrets'
+
     # local gluster fuse client mount related config
     LOCAL_MOUNT_BASE = FuseConfig.FUSE_PATH_BASE.value
     CTDB_VOL_NAME = 'ctdb_shared_vol'
@@ -53,6 +57,7 @@ class CTDBConfig(enum.Enum):
     GM_RECOVERY_FILE = os.path.join(CTDB_LOCAL_MOUNT, REC_FILE)
     GM_PRI_IP_FILE = os.path.join(CTDB_LOCAL_MOUNT, PRIVATE_IP_FILE)
     GM_PUB_IP_FILE = os.path.join(CTDB_LOCAL_MOUNT, PUBLIC_IP_FILE)
+    GM_SECRETS = os.path.join(CTDB_LOCAL_MOUNT, SECRETS_DIR)
 
     # ctdb etc config
     CTDB_ETC = '/etc/ctdb'

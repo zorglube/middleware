@@ -848,7 +848,7 @@ class KerberosKeytabService(TDBWrapCRUDService):
     async def do_ktutil_list(self, data):
         kt = data.get("kt_name", keytab.SYSTEM.value)
         if KRB5.platform() == KRB5.MIT:
-            ktutil = await run(["klist", "-tek"], check=False)
+            ktutil = await run(["klist", "-tek", kt], check=False)
             if ktutil.returncode != 0:
                 raise CallError(ktutil.stderr.decode())
             ret = ktutil.stdout.decode().splitlines()

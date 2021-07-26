@@ -1,4 +1,6 @@
 import errno
+import os
+import contextlib
 from pathlib import Path
 from glustercli.cli import volume
 
@@ -10,6 +12,7 @@ MOUNT_UMOUNT_LOCK = CTDBConfig.MOUNT_UMOUNT_LOCK.value
 CRE_OR_DEL_LOCK = CTDBConfig.CRE_OR_DEL_LOCK.value
 CTDB_VOL_NAME = CTDBConfig.CTDB_VOL_NAME.value
 CTDB_LOCAL_MOUNT = CTDBConfig.CTDB_LOCAL_MOUNT.value
+CTDB_SECRETS = CTDBConfig.GM_SECRETS.value
 
 
 class CtdbSharedVolumeService(Service):
@@ -94,6 +97,19 @@ class CtdbSharedVolumeService(Service):
         # FUSE mount it
         data = {'event': 'VOLUME_START', 'name': CTDB_VOL_NAME, 'forward': True}
         await self.middleware.call('gluster.localevents.send', data)
+
+        mount_job = await self.middleware.call("core.get_jobs", [
+            ("method", "=", "gluster.fuse.mount"),
+            ("arguments.0.name", "=", "ctdb_shared_vol"),
+            ("state", "=", "RUNNING")
+        ])
+
+        if mount_job:
+            wait_id = await self.middleware.call('core.job_wait', mount_job[0]['id'])
+            await wait_id.wait()
+
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(CTDB_SECRETS, mode=0o700)
 
         return await self.middleware.call('gluster.volume.query', [('name', '=', CTDB_VOL_NAME)])
 

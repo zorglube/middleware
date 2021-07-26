@@ -1,4 +1,5 @@
 import tdb
+import os
 import json
 from middlewared.service_exception import MatchNotFound, CallError
 from middlewared.utils import filter_list
@@ -9,12 +10,20 @@ class TDBWrap(object):
     def __init__(self, path, **kwargs):
         self.path = path
         self.flags = kwargs.get('flags', 0)
+        self.create = self.flags & os.O_CREAT
         self.handle = None
         self.is_open = False
         self.is_clustered = kwargs.get('clustered', False)
 
     def open_tdb(self):
-        self.handle = tdb.open(self.path, self.flags)
+        try:
+            self.handle = tdb.open(self.path, self.flags)
+        except FileNotFoundError:
+            if not self.create:
+                raise
+
+            self.handle = tdb.Tdb(self.path, 0, tdb.DEFAULT, os.O_CREAT | os.O_RDWR)
+
         self.is_open = True
 
     def get(self, key):
@@ -118,6 +127,7 @@ class CTDBWrap(TDBWrap):
         Set key to value, creating if necessary.
         `key` and `val` are both strings.
         """
+
         tdb_set = run(['ctdb', 'pstore', self.dbid, key, val], capture_output=True)
         if tdb_set.returncode != 0:
             raise CallError(f"{key}: failed to set to {val}: {tdb_set.stderr.decode()}")
@@ -142,9 +152,6 @@ class CTDBWrap(TDBWrap):
             raise CallError(f"{self.dbid}: failed to traverse: {trv.stderr.decode()}")
 
         tdb_entries = json.loads(trv.stdout.decode())
-        with open("/tmp/traverse.out", "w") as f:
-            f.write(str(tdb_entries))
-
         for i in tdb_entries['data'][1:]:
             ok = fn(i['key'], i['val'], private_data)
             if not ok:
@@ -200,6 +207,7 @@ class TDBWrapCRUD(CTDBWrap):
                 return True
 
             entry = {"id": int(tdb_key[data["prefix_len"]:])}
+
             tdb_json = json.loads(tdb_val)
             entry.update(tdb_json)
 
@@ -212,7 +220,8 @@ class TDBWrapCRUD(CTDBWrap):
             "prefix_len": len(self.schema) + 1,
             "hwm": 1,
             "entries": [],
-            "by_id": {}
+            "by_id": {},
+            "private": self.private,
         }
 
         self.traverse(tdb_to_list, state)
@@ -242,8 +251,9 @@ class TDBWrapCRUD(CTDBWrap):
 
         id = state["hwm"] + 1
         tdb_key = f'{self.schema}_{id}'
+        tdb_val = json.dumps(data)
 
-        self.set(tdb_key, json.dumps(data))
+        self.set(tdb_key, tdb_val)
         self.set("hwm", str(id))
 
         return id
