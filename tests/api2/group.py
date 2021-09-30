@@ -19,7 +19,7 @@ GroupIdFile = "/tmp/.ixbuild_test_groupid"
 
 
 def test_00_reinstall_middleware():
-    cmd = 'git clone test-fix-ha-smb https://github.com/truenas/middleware'
+    cmd = 'git clone --branch test-fix-ha-smb https://github.com/truenas/middleware'
     results = SSH_TEST(cmd, user, password, ip)
     assert results['result'] is True, results['output']
 
