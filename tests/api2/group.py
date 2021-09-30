@@ -18,6 +18,16 @@ from pytest_dependency import depends
 GroupIdFile = "/tmp/.ixbuild_test_groupid"
 
 
+def test_00_reinstall_middleware():
+    cmd = 'git clone test-fix-ha-smb https://github.com/truenas/middleware'
+    results = SSH_TEST(cmd, user, password, ip)
+    assert results['result'] is True, results['output']
+
+    cmd = 'cd middleware/src/middlewared && make reinstall && service middlewared restart'
+    results = SSH_TEST(cmd, user, password, ip)
+    assert results['result'] is True, results['output']
+    
+
 def test_01_get_next_gid():
     results = GET('/group/get_next_gid/')
     assert results.status_code == 200, results.text
