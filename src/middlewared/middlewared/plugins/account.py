@@ -1148,6 +1148,8 @@ class GroupService(CRUDService):
         group = await self.group_compress(group)
         await self.middleware.call('datastore.update', 'account.bsdgroups', pk, group, {'prefix': 'bsdgrp_'})
 
+        self.logger.debug("XXX: groupmap_changed: %s, data: %s\n", groupmap_changed, data)
+
         if 'users' in data:
             existing = {i['bsdgrpmember_user']['id']: i for i in await self.middleware.call('datastore.query', 'account.bsdgroupmembership', [('bsdgrpmember_group', '=', pk)])}
             to_remove = set(existing.keys()) - set(data['users'])

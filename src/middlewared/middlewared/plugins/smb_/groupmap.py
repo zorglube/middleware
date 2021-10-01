@@ -266,6 +266,10 @@ class SMBService(Service):
         payload = {"ADD": [{"groupmap": []}], "MOD": [{"groupmap": []}], "DEL": [{"groupmap": []}]}
         must_reload = False
 
+        if not idmap_range:
+            tp = await run(['testparm', '-s'], check=False)
+            self.logger.debug("XXX: testparm output: %s", tp.stdout.decode())
+
         if idmap_backend != "tdb":
             """
             idmap_autorid and potentially other allocating idmap backends may be used for
@@ -403,6 +407,7 @@ class SMBService(Service):
         if to_del:
             payload["DEL"] = [{"groupmap": to_del}]
 
+        self.logger.debug("XXX: payload: %s\n", payload)
         await self.middleware.call('smb.fixsid')
         must_remove_cache = await self.sync_builtins(groupmap['builtins'])
         await self.batch_groupmap(payload)
