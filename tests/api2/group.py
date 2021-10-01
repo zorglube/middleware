@@ -18,6 +18,12 @@ from pytest_dependency import depends
 GroupIdFile = "/tmp/.ixbuild_test_groupid"
 
 
+def test_000_check_failover_status():
+    results = GET('/failover/status/')
+    assert results.status_code == 200, results.text
+    assert results.json() == 'MASTER'
+
+
 def test_00_reinstall_middleware():
     cmd = 'git clone --branch test-fix-ha-smb https://github.com/truenas/middleware'
     results = SSH_TEST(cmd, user, password, ip)

@@ -51,6 +51,10 @@ home_acl = [
     },
 ]
 
+def test_000_check_failover_status():
+    results = GET('/failover/status/')
+    assert results.status_code == 200, results.text
+    assert results.json() == 'MASTER'
 
 def test_01_get_next_uid():
     results = GET('/user/get_next_uid/')
