@@ -33,6 +33,10 @@ def test_00_reinstall_middleware():
     results = SSH_TEST(cmd, user, password, ip)
     assert results['result'] is True, results['output']
     
+    cmd = 'midclt call etc.generate smb'
+    results = SSH_TEST(cmd, user, password, ip)
+    assert results['result'] is True, results['output']
+
 
 def test_01_get_next_gid():
     results = GET('/group/get_next_gid/')
