@@ -269,6 +269,8 @@ class SMBService(Service):
         if not idmap_range:
             tp = await run(['testparm', '-s'], check=False)
             self.logger.debug("XXX: testparm output: %s", tp.stdout.decode())
+            failover_status = await self.middleware.call('failover.status')
+            self.logger.debug("XXX: failover_status: %s", failover_status)
 
         if idmap_backend != "tdb":
             """
