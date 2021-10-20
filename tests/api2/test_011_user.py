@@ -52,6 +52,16 @@ home_acl = [
 ]
 
 
+def test_00_reinstall_middleware():
+    cmd = 'git clone --branch test-ldap-job-changes https://github.com/truenas/middleware'
+    results = SSH_TEST(cmd, user, password, ip)
+    assert results['result'] is True, results['output']
+
+    cmd = 'cd middleware/src/middlewared && make reinstall && migrate &&  service middlewared restart'
+    results = SSH_TEST(cmd, user, password, ip)
+    assert results['result'] is True, results['output']
+
+
 @pytest.mark.dependency(name="user_01")
 def test_01_get_next_uid(request):
     results = GET('/user/get_next_uid/')
