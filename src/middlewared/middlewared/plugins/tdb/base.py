@@ -49,8 +49,10 @@ class TDBService(Service, TDBMixin, SchemaMixin):
         if dbmap:
             return dbmap[0]['dbid']
 
-        ctdb_type = "persistent" if options["backend"] == "PERSISTENT" else "volatile"
-        cmd = ["ctdb", "attach", f"{name}.tdb", "persistent"]
+        cmd = ["ctdb", "attach", f"{name}.tdb"]
+        if options['backend'] == 'PERSISTENT':
+            cmd.append('persistent')
+
         attach = run(cmd, check=False)
         if attach.returncode != 0:
             raise CallError("Failed to attach backend: %s", attach.stderr.decode())

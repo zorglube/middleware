@@ -128,7 +128,7 @@ class CTDBWrap(object):
         return
 
     def get(self, tdb_key):
-        ctdb_op = 'pfetch' if options['backend'] == 'PERSISTENT' else 'fetchkey'
+        ctdb_op = 'pfetch' if self.options['backend'] == 'PERSISTENT' else 'readkey'
         cmd = ['ctdb', ctdb_op, self.dbid, tdb_key]
         tdb_get = run(cmd, capture_output=True)
         if tdb_get.returncode != 0:
@@ -141,7 +141,7 @@ class CTDBWrap(object):
         return tdb_val
 
     def store(self, key, val):
-        ctdb_op = 'pstore' if options['backend'] == 'PERSISTENT' else 'writekey'
+        ctdb_op = 'pstore' if self.options['backend'] == 'PERSISTENT' else 'writekey'
         tdb_set = run(['ctdb', ctdb_op, self.dbid, key, val], capture_output=True)
         if tdb_set.returncode != 0:
             raise CallError(f"{key}: failed to set to {val}: {tdb_set.stderr.decode()}")
@@ -152,7 +152,7 @@ class CTDBWrap(object):
         """
         remove a single entry from tdb file.
         """
-        ctdb_op = 'pdelete' if options['backend'] == 'PERSISTENT' else 'deletekey'
+        ctdb_op = 'pdelete' if self.options['backend'] == 'PERSISTENT' else 'deletekey'
         tdb_del = run(['ctdb', ctdb_op, self.dbid, key], capture_output=True)
         if tdb_del.returncode != 0:
             raise CallError(f"{key}: failed to delete: {tdb_del.stderr.decode()}")
@@ -177,7 +177,7 @@ class CTDBWrap(object):
         return keys
 
     def batch_op(self, ops):
-        if options['backend'] == 'VOLATILE':
+        if self.options['backend'] == 'VOLATILE':
             raise CallError("Batch operations not supported on VOLATILE backend")
 
         input = []
