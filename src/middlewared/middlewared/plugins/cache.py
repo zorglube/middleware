@@ -13,6 +13,7 @@ import json
 class ClusterCacheService(Service):
     tdb_options = {
         "cluster": True,
+        "backend": "VOLATILE",
         "data_type": "STRING"
     }
 
@@ -31,7 +32,7 @@ class ClusterCacheService(Service):
         CLOCK_REALTIME because clustered
         """
         payload = {
-            "name": 'middlewared',
+            "name": 'volatile_middlewared',
             "key": key,
             "tdb-options": self.tdb_options
         }
@@ -59,7 +60,7 @@ class ClusterCacheService(Service):
         Removes and returns `key` from cache.
         """
         payload = {
-            "name": 'middlewared',
+            "name": 'volatile_middlewared',
             "key": key,
             "tdb-options": self.tdb_options
         }
@@ -81,7 +82,7 @@ class ClusterCacheService(Service):
     async def has_key(self, key):
         try:
             await self.middleware.call('tdb.fetch', {
-                "name": 'middlewared',
+                "name": 'volatile_middlewared',
                 "key": key,
                 "tdb-options": self.tdb_options
             })
@@ -138,7 +139,7 @@ class ClusterCacheService(Service):
                 raise KeyError(key)
 
         await self.middleware.call('tdb.store', {
-            'name': 'middlewared',
+            "name": 'volatile_middlewared',
             'key': tdb_key,
             'value': {'payload': tdb_val},
             'tdb-options': self.tdb_options
@@ -163,7 +164,7 @@ class ClusterCacheService(Service):
 
         parsed = []
         tdb_entries = await self.middleware.call('tdb.entries', {
-            'name': 'middlewared',
+            "name": 'volatile_middlewared',
             'tdb-options': self.tdb_options
         })
         for entry in tdb_entries:

@@ -49,6 +49,7 @@ class TDBService(Service, TDBMixin, SchemaMixin):
         if dbmap:
             return dbmap[0]['dbid']
 
+        ctdb_type = "persistent" if options["backend"] == "PERSISTENT" else "volatile"
         cmd = ["ctdb", "attach", f"{name}.tdb", "persistent"]
         attach = run(cmd, check=False)
         if attach.returncode != 0:
