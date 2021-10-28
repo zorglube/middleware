@@ -112,7 +112,7 @@ def test_08_setup_and_enabling_ldap(request):
         "basedn": ad_ldap_domain_info['Bind Path'],
         "binddn": '',
         "bindpw": '',
-        "hostname": [ AD_DOMAIN ],
+        "hostname": [AD_DOMAIN],
         "has_samba_schema": False,
         "ssl": "OFF",
         "kerberos_realm": ad_realm_id,
