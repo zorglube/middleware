@@ -225,6 +225,12 @@ class SMBService(TDBWrapConfigService):
 
     LP_CTX = param.LoadParm(SMBPath.GLOBALCONF.value[0])
 
+    configured = False
+
+    @private
+    async def is_configured(self):
+        return self.configured
+
     @private
     async def smb_extend(self, smb):
         """Extend smb for netbios."""
@@ -564,6 +570,7 @@ class SMBService(TDBWrapConfigService):
         This step is not required when underlying database is clustered (cluster node should
         just recover with info from other nodes on reboot).
         """
+        self.configured = True
         job.set_progress(60, 'generating SMB share configuration.')
         await self.middleware.call('sharing.smb.sync_registry')
 
@@ -1709,6 +1716,14 @@ async def pool_post_import(middleware, pool):
         asyncio.ensure_future(middleware.call('sharing.smb.sync_registry'))
         return
 
+    smb_is_configured = await middleware.call("smb.is_configured")
+    if not smb_is_configured:
+        middleware.logger.warning(
+            "Skipping SMB share config sync because SMB service "
+            "has not been fully initialized."
+        )
+        return
+
     path = f'/mnt/{pool["name"]}'
     if await middleware.call('sharing.smb.query', [
         ('OR', [
@@ -1734,6 +1749,14 @@ class SMBFSAttachmentDelegate(LockableFSAttachmentDelegate):
         the share being attached.
         """
         await self.middleware.call('smb.disable_acl_if_trivial')
+        smb_is_configured = await self.middleware.call("smb.is_configured")
+        if not smb_is_configured:
+            self.logger.warning(
+                "Skipping SMB share config sync because SMB service "
+                "has not been fully initialized."
+            )
+            return
+
         reg_sync = await self.middleware.call('sharing.smb.sync_registry')
         await reg_sync.wait()
         await self.middleware.call('service.reload', 'mdns')
