@@ -4,6 +4,7 @@ from glustercli.cli import volume
 
 from middlewared.service import Service, CallError, job
 from middlewared.plugins.cluster_linux.utils import CTDBConfig
+from middlewared.validators import IpAddress
 
 
 MOUNT_UMOUNT_LOCK = CTDBConfig.MOUNT_UMOUNT_LOCK.value
@@ -48,23 +49,23 @@ class CtdbSharedVolumeService(Service):
         Create and mount the shared volume to be used
         by ctdb daemon.
         """
+        # get the peers in the TSP
+        peers = await self.middleware.call('gluster.peer.query')
+        if not peers:
+            raise CallError('No peers detected')
+
+        # shared storage volume requires 3 nodes, minimally, to
+        # prevent the dreaded split-brain
+        con_peers = [i['hostname'] for i in peers if i['connected'] == 'Connected']
+        if len(con_peers) < 3:
+            raise CallError(
+                '3 peers must be present and connected before the ctdb '
+                'shared volume can be created.'
+            )
+
         # check if ctdb shared volume already exists and started
         info = await self.middleware.call('gluster.volume.exists_and_started', CTDB_VOL_NAME)
         if not info['exists']:
-            # get the peers in the TSP
-            peers = await self.middleware.call('gluster.peer.query')
-            if not peers:
-                raise CallError('No peers detected')
-
-            # shared storage volume requires 3 nodes, minimally, to
-            # prevent the dreaded split-brain
-            con_peers = [i['hostname'] for i in peers if i['connected'] == 'Connected']
-            if len(con_peers) < 3:
-                raise CallError(
-                    '3 peers must be present and connected before the ctdb '
-                    'shared volume can be created.'
-                )
-
             # get the system dataset location
             ctdb_sysds_path = (await self.middleware.call('systemdataset.config'))['path']
             ctdb_sysds_path = str(Path(ctdb_sysds_path).joinpath(CTDB_VOL_NAME))
@@ -106,15 +107,31 @@ class CtdbSharedVolumeService(Service):
         # only accepts IP addresses. This means we need to resolve
         # the hostnames of the peers in the TSP to their respective
         # IP addresses so we can write them to the ctdb private ip file.
-        names = [i['hostname'] for i in await self.middleware.call('gluster.peer.query')]
-        ips = await self.middleware.call('cluster.utils.resolve_hostnames', names)
-        if len(names) != len(ips):
-            # this means the gluster peers hostnames resolved to the same
-            # ip address which is bad....in theory, this shouldn't occur
-            # since adding gluster peers has it's own validation and would
-            # cause it to fail way before this gets called but it's better
-            # to be safe than sorry
-            raise CallError('Duplicate gluster peer IP addresses detected.')
+        names = []
+        ips = []
+        for peer in con_peers:
+            # gluster.peer.query will return hostnames for the peers
+            # if DNS resolves them, else it will return whatever was
+            # given to us by end-user (IPs or DNS names)
+            try:
+                IpAddress()(peer)
+                ips.append(peer)
+            except ValueError:
+                # means this is more than likely a hostname
+                # so add it to list for DNS resolution
+                names.append(peer)
+
+        if names:
+            try:
+                ips.extend([i['address'] for i in await self.middleware.call('dnsclient.forward_lookup', names)])
+            except Exception as e:
+                raise CallError(f'Failed to resolve gluster peers hostnames: {e}')
+
+        if len(ips) != len(con_peers):
+            # means we had to resolve hostnames for at least one of the gluster peers
+            # and the DNS resolution returned multiple IP addresses for that peer.
+            # No easy way to handle this so raise an error.
+            raise CallError('Gluster peer DNS name(s) resolved to more than 1 IP address')
 
         # Setup the ctdb daemon config. Without ctdb daemon running, none of the
         # sharing services (smb/nfs) will work in an active-active setting.
