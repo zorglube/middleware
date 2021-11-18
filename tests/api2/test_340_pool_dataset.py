@@ -96,6 +96,7 @@ def test_07_promoting_dataset(request):
 # and stat output confirms its absence.
 
 
+@pytest.mark.dependency(name="acl_pool_perm_08")
 def test_08_set_acl_for_dataset(request):
     depends(request, ["create_dataset"])
     global JOB_ID
