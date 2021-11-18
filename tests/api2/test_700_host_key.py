@@ -31,7 +31,7 @@ if not ha:
         results = GET("/service?service=ssh")
         assert results.json()[0]['state'] == "RUNNING"
 
-    @pytest.mark.pytest_dependency(name="get_keyscan")
+    @pytest.mark.dependency(name="get_keyscan")
     def test_04_get_ssh_keyscan_before_reboot(request):
         depends(request, ["ssh_key"], scope="session")
         global output_before
