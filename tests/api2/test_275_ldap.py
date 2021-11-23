@@ -226,7 +226,7 @@ def test_21_verify_testfile_exit_with_in_the_smb_share_with_filesystem_stat(requ
     results = POST('/filesystem/stat/', f'{smb_path}/testfile.txt')
     assert results.status_code == 200, results.text
 
-"""
+
 def test_22_set_has_samba_schema_to_false(request):
     depends(request, ["setup_ldap", "ldap_dataset", "smb_share_ldap"], scope="session")
     payload = {
@@ -384,4 +384,3 @@ def test_43_destroying_ad_dataset_for_smb(request):
     depends(request, ["setup_ldap", "ldap_dataset"], scope="session")
     results = DELETE(f"/pool/dataset/id/{dataset_url}/")
     assert results.status_code == 200, results.text
-"""
