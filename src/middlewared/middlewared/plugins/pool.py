@@ -1501,10 +1501,17 @@ class PoolService(CRUDService):
                 'pool': pool_id,
             })
 
-            await self.middleware.call('zfs.pool.import_pool', pool['guid'], {
-                'altroot': '/mnt',
-                'cachefile': ZPOOL_CACHE_FILE,
-            }, True, None, pool_name)
+            opts = {'altroot': '/mnt'}
+            any_host = True
+            cachefile = ZPOOL_CACHE_FILE
+            try:
+                await self.middleware.call('zfs.pool.import_pool', pool['guid'], opts, any_host, cachefile, pool_name)
+            except Exception:
+                if cachefile:
+                    self.logger.warning('Failed importing %r using cachefile, retrying.', pool_name)
+                    await self.middleware.call('zfs.pool.import_pool', pool['guid'], opts, any_host, None, pool_name)
+                else:
+                    raise
 
             await self.middleware.call('zfs.dataset.update', pool_name, {
                 'properties': {
@@ -1825,37 +1832,38 @@ class PoolService(CRUDService):
 
                 start_daemon_thread(target=self.__dtrace_read, args=[job, proc])
 
-            pools = self.middleware.call_sync('pool.query', [
-                ('encrypt', '<', 2),
-                ('status', '=', 'OFFLINE')
-            ])
+            opts = {'altroot': '/mnt'}
+            any_host = True
+            cachefile = zpool_cache_saved if os.path.exists(zpool_cache_saved) else None
+            new_name = None
+            pools = self.middleware.call_sync('pool.query', [('encrypt', '<', 2), ('status', '=', 'OFFLINE')])
             for i, pool in enumerate(pools):
                 # Importing pools is currently 80% of the job because we may still need
                 # to set ACL mode for windows
                 job.set_progress(int((i + 1) / len(pools) * 80), f'Importing {pool["name"]}')
-                imported = False
                 if pool['guid']:
                     try:
-                        self.middleware.call_sync('zfs.pool.import_pool', pool['guid'], {
-                            'altroot': '/mnt',
-                            'cachefile': 'none',
-                        }, True, zpool_cache_saved if os.path.exists(zpool_cache_saved) else None)
+                        self.middleware.call_sync(
+                            'zfs.pool.import_pool', pool['guid'], opts, any_host, cachefile, new_name
+                        )
                     except Exception:
-                        # Importing a pool may fail because of out of date guid database entry
-                        # or because bad cachefile. Try again using the pool name and wihout
-                        # the cachefile
-                        self.logger.error('Failed to import %s', pool['name'], exc_info=True)
-                    else:
-                        imported = True
-                if not imported:
-                    try:
-                        self.middleware.call_sync('zfs.pool.import_pool', pool['name'], {
-                            'altroot': '/mnt',
-                            'cachefile': 'none',
-                        })
-                    except Exception:
-                        self.logger.error('Failed to import %s', pool['name'], exc_info=True)
-                        continue
+                        failed = True
+                        if cachefile:
+                            # Importing a pool may fail because of out of date guid database entry
+                            # or because bad cachefile. Try again using the pool name and wihout
+                            # the cachefile
+                            self.logger.warning('Failed importing %r using cachefile, retrying.', pool['name'])
+                            try:
+                                self.middleware.call_sync(
+                                    'zfs.pool.import_pool', pool['name'], opts, any_host, None, new_name
+                                )
+                                failed = False
+                            except Exception:
+                                pass
+
+                        if failed:
+                            self.logger.error('Failed to import %s', pool['name'], exc_info=True)
+                            continue
 
                 try:
                     self.middleware.call_sync(
