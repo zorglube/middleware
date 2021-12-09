@@ -576,6 +576,8 @@ def test_58_check_ad_user_ssh_access(request):
     result = SSH_TEST("pwd", CMD_AD_USER, ADPASSWORD, ip)
     assert result['result'] is True, str(result['output'])
 
+
+"""
     result = PUT("/activedirectory/", {"restrict_pam": True})
     assert result.status_code == 200, result.text
 
@@ -668,3 +670,4 @@ def test_69_configure_setting_domain_hostname_and_dns(request):
     global results
     results = PUT("/network/configuration/", payload)
     assert results.status_code == 200, results.text
+"""
