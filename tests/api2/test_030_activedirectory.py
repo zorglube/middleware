@@ -568,14 +568,32 @@ def test_57_get_activedirectory_state(request):
     assert results.json() == 'HEALTHY', results.text
 
 
-def test_58_get_activedirectory_started(request):
+def test_58_check_ad_user_ssh_access(request):
+    """
+    SSH access should succeed with defaults, but
+    fail when PAM is restricted.
+    """
+    result = SSH_TEST("pwd", CMD_AD_USER, ADPASSWORD, ip)
+    assert result['result'] is True, str(result['output'])
+
+    result = PUT("/activedirectory/", {"restrict_pam": True})
+    assert result.status_code == 200, result.text
+
+    result = SSH_TEST("pwd", CMD_AD_USER, ADPASSWORD, ip)
+    assert result['result'] is True, str(result['output'])
+
+    result = PUT("/activedirectory/", {"restrict_pam": False})
+    assert result.status_code == 200, result.text
+
+
+def test_59_get_activedirectory_started(request):
     depends(request, ["ad_dataset_permission"], scope="session")
     results = GET('/activedirectory/started/')
     assert results.status_code == 200, results.text
     assert results.json() is True, results.text
 
 
-def test_59_leave_activedirectory(request):
+def test_60_leave_activedirectory(request):
     depends(request, ["ad_dataset_permission"], scope="session")
     global payload, results
     payload = {
@@ -588,40 +606,40 @@ def test_59_leave_activedirectory(request):
     assert job_status['state'] == 'SUCCESS', str(job_status['results'])
 
 
-def test_60_verify_activedirectory_leave_do_not_leak_password_in_middleware_log(request):
+def test_61_verify_activedirectory_leave_do_not_leak_password_in_middleware_log(request):
     depends(request, ["ad_dataset_permission", "ssh_password"], scope="session")
     cmd = f"""grep -R "{ADPASSWORD}" /var/log/middlewared.log"""
     results = SSH_TEST(cmd, user, password, ip)
     assert results['result'] is False, str(results['output'])
 
 
-def test_61_get_activedirectory_state(request):
+def test_62_get_activedirectory_state(request):
     depends(request, ["ad_dataset_permission"], scope="session")
     results = GET('/activedirectory/get_state/')
     assert results.status_code == 200, results.text
     assert results.json() == 'DISABLED', results.text
 
 
-def test_62_get_activedirectory_started_after_living(request):
+def test_63_get_activedirectory_started_after_living(request):
     depends(request, ["ad_dataset_permission"], scope="session")
     results = GET('/activedirectory/started/')
     assert results.status_code == 200, results.text
     assert results.json() is False, results.text
 
 
-def test_63_disable_cifs_service_at_boot(request):
+def test_64_disable_cifs_service_at_boot(request):
     depends(request, ["ad_dataset_permission"], scope="session")
     results = PUT("/service/id/cifs/", {"enable": False})
     assert results.status_code == 200, results.text
 
 
-def test_64_checking_to_see_if_clif_service_is_enabled_at_boot(request):
+def test_65_checking_to_see_if_clif_service_is_enabled_at_boot(request):
     depends(request, ["ad_dataset_permission"], scope="session")
     results = GET("/service?service=cifs")
     assert results.json()[0]["enable"] is False, results.text
 
 
-def test_65_stoping_clif_service(request):
+def test_66_stoping_clif_service(request):
     depends(request, ["ad_dataset_permission"], scope="session")
     payload = {"service": "cifs"}
     results = POST("/service/stop/", payload)
@@ -629,19 +647,19 @@ def test_65_stoping_clif_service(request):
     sleep(1)
 
 
-def test_66_checking_if_cifs_is_stop(request):
+def test_67_checking_if_cifs_is_stop(request):
     depends(request, ["ad_dataset_permission"], scope="session")
     results = GET("/service?service=cifs")
     assert results.json()[0]['state'] == "STOPPED", results.text
 
 
-def test_67_destroying_ad_dataset_for_smb(request):
+def test_68_destroying_ad_dataset_for_smb(request):
     depends(request, ["ad_dataset"], scope="session")
     results = DELETE(f"/pool/dataset/id/{dataset_url}/")
     assert results.status_code == 200, results.text
 
 
-def test_68_configure_setting_domain_hostname_and_dns(request):
+def test_69_configure_setting_domain_hostname_and_dns(request):
     depends(request, ["ad_01", "ad_02"], scope="session")
     global payload
     payload = {
