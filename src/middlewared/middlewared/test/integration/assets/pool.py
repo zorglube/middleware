@@ -14,4 +14,4 @@ def dataset(name):
     try:
         yield dataset
     finally:
-        call("pool.dataset.delete", dataset)
+        call("pool.dataset.delete", dataset, {"recursive": True})
