@@ -14,6 +14,7 @@ from functions import PUT, POST, GET, DELETE, SSH_TEST, wait_on_job
 from auto_config import ip, hostname, password, user
 from base64 import b64decode
 from pytest_dependency import depends
+from time import sleep
 
 try:
     from config import AD_DOMAIN, ADPASSWORD, ADUSERNAME, ADNameServer
@@ -172,6 +173,7 @@ def test_08_test_backend_options(request, backend):
     if not payload['options']:
         payload.pop('options')
 
+    sleep(5)
     results = PUT("/idmap/id/1/", payload)
     assert results.status_code == 200, f'payload: {payload}, results: {results.text}'
 
@@ -315,5 +317,6 @@ def test_08_test_backend_options(request, backend):
         "idmap_backend": 'RID',
         "options": {}
     }
+    sleep(5)
     results = PUT("/idmap/id/1/", payload)
     assert results.status_code == 200, results.text
