@@ -126,6 +126,7 @@ def test_08_setup_and_enabling_ldap(request):
     assert job_status['state'] == 'SUCCESS', str(job_status['results'])
 
 
+"""
 def test_09_check_kerberos_ldap(request):
     depends(request, ["SET_UP_AD_VIA_LDAP", "ssh_password"], scope="session")
 
@@ -209,3 +210,4 @@ def test_22_reset_dns(request):
     global results
     results = PUT("/network/configuration/", payload)
     assert results.status_code == 200, results.text
+"""
