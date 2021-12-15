@@ -173,7 +173,7 @@ def test_08_test_backend_options(request, backend):
     if not payload['options']:
         payload.pop('options')
 
-    sleep(5)
+    sleep(2.5)
     results = PUT("/idmap/id/1/", payload)
     assert results.status_code == 200, f'payload: {payload}, results: {results.text}'
 
@@ -317,6 +317,6 @@ def test_08_test_backend_options(request, backend):
         "idmap_backend": 'RID',
         "options": {}
     }
-    sleep(5)
+    sleep(2.5)
     results = PUT("/idmap/id/1/", payload)
     assert results.status_code == 200, results.text
