@@ -424,6 +424,9 @@ if not ha:
         assert isinstance(results.json(), int), results.text
         job_status = wait_on_job(results.json(), 600)
         assert job_status['state'] == 'SUCCESS', str(job_status['results'])
+        # Sleep 5 second to let NAS get ready do delete Plex
+        # Deleting Plex after 1.* second is far from a real case scenario
+        time.sleep(5)
 
     def test_41_verify_plex_is_at_the_old_version(request):
         depends(request, ['rollback_plex'])
