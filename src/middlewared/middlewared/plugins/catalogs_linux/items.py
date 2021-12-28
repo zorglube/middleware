@@ -335,16 +335,16 @@ class CatalogService(Service):
         if not questions_context:
             questions_context = self.middleware.call_sync('catalog.get_normalised_questions_context')
         version_data = {'location': version_path, 'required_features': set()}
-        for key, filename, parser in (
-            ('chart_metadata', 'Chart.yaml', yaml.safe_load),
-            ('schema', 'questions.yaml', yaml.safe_load),
-            ('app_readme', 'app-readme.md', markdown.markdown),
-            ('detailed_readme', 'README.md', markdown.markdown),
-            ('changelog', 'CHANGELOG.md', markdown.markdown),
+        for key, filename, parser, default in (
+            ('chart_metadata', 'Chart.yaml', yaml.safe_load, {}),
+            ('schema', 'questions.yaml', yaml.safe_load, {}),
+            ('app_readme', 'app-readme.md', markdown.markdown, None),
+            ('detailed_readme', 'README.md', markdown.markdown, None),
+            ('changelog', 'CHANGELOG.md', markdown.markdown, None),
         ):
             if os.path.exists(os.path.join(version_path, filename)):
                 with open(os.path.join(version_path, filename), 'r') as f:
-                    version_data[key] = parser(f.read())
+                    version_data[key] = parser(f.read()) or default
             else:
                 version_data[key] = None
 
